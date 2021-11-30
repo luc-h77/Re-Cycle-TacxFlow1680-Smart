@@ -1,0 +1,1188 @@
+/*
+ *  Re-Cycle Smart Tacx FLow 1680
+    Lukas Hoffmann, 2021
+*/
+
+//bluetooth
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEServer.h>
+#include <BLE2902.h>
+
+//web server
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+
+//JSON
+#include <ArduinoJson.h>
+
+//EEPROM - save into ESP32 memory
+#include <EEPROM.h>
+
+// web server variables
+const char* SSID = "[WIFI ID}";                     // <== CHANGE this!!! --------------------------------------
+const char* PASSWORD = "{WIFI password]";           // <== CHANGE this!!! --------------------------------------
+const char* PWM_INPUT = "pwm_input";
+const char* TARGET_INPUT = "target_input";
+const char* SPEED_INPUT = "speed_input";
+const char* SPINDOWN_START = "spindown_start";
+const char* SPINDOWN_SAVE = "spindown_save";
+const char* SPINDOWN_RESET = "spindown_reset";
+const char* PWM_PLUS1 = "pwm_plus1";
+const char* PWM_MINUS1 = "pwm_minus1";
+const char* RESET = "reset";
+const char* ADJUSTMENT_INPUT = "adjustment_input";
+const char* WARMUPMIN_INPUT  = "warmupmin_input";
+const char* WARMUPERC_INPUT  = "warmupperc_input";
+
+boolean bln_appControlled = false;
+boolean bln_speedControlled = false;
+AsyncWebServer webServer(80);
+/**
+ * Speed and Cadence sensor pins
+ */
+#define SPEED             15 
+#define PWM                4
+#define SYNC              18
+#define BUTTON            13
+#define RED               32
+#define GREEN             33
+#define EEPROM_SIZE        4
+#define EEPROM_ADDR_SPIN   0
+
+/**
+ * constants for the calculation of the power output
+ */
+const float  ADJ_FACTOR = 1.05;            // Kickr reports 5% more than Power2Max crank used for testing. Align Trainer with Kickr
+const int    WEIGHT_ACC  = 90;             // Weight rider + bike. Don't change this, required for the power calculation with acceleration
+const float  WARMUP_FACTOR = 0.10;         // factor to increase initial power output as trainer reports less during warm-up period
+const double BRAKE_SIZE = 23.35;           // Distance between two brake speed pulses in mm.
+const double WHEEL_SIZE = 2100;            // Circumference of the wheel, to be defined by the rider, in mm.
+const float  TARGETSHIFT_FACTOR = 0.08;    // Shift when x seconds average power deviates from target power by this factor
+const long   SPINDOWNDEFAULT = 13500;     // Default Spindown factor
+
+/**
+ * variables for the resistance calculation of the trainer
+ */
+float fl_wind_speed  = 0; // meters per second, resolution 0.001
+float fl_grade       = 0; // percentage, resolution 0.01
+float fl_crr         = 0; // Coefficient of rolling resistance, resolution 0.0001
+float fl_cw          = 0; // Wind resistance Kg/m, resolution 0.01;
+float fl_targetWatts = 0; // Targer Watts
+
+
+// power calculation variables
+int int_currentPwm = 4;                  // Initial resistance grade = 0%
+int int_watts = 0;                       // int_watts interpolated to measurement points
+int int_watts_acc = 0;                   // int_watts including acceleration
+volatile float fl_time_factor = 1.00;    // time needed to warm the tyre up
+volatile long lg_warmup_millis = 600000; // parameter for milliseconds to warm the trainer up
+float fl_adj_factor = 1.05;               // default adjustment factor to map from Crank power to Kickr
+
+// Speed and cadence variables
+volatile unsigned long lg_speed_counter = 0;   // The incrementing counter of speed pulses from the brake
+volatile unsigned long lg_speed_timer = 0;     // The last speed interrupt time
+unsigned long lg_speed_counter_ibd = 0;        // The previous amount of speed pulses written to indoor bike data
+unsigned long lg_speed_timer_ibd = 0;          // The previous time written to ibd
+double fl_current_speed = 0;             // Global variable to hold the calculated speed
+double fl_previous_speed = 0;                  // previous speed measured 1 second before
+long lg_previous_notification = 0;
+
+volatile unsigned long lg_cadence_counter = 0; // The incrementing counter of cranck revolutions
+volatile unsigned long lg_cadence_timer;       // The last cadence interrupt time
+unsigned long lg_cadence_counter_ibd = 0;      // The previous amount of cadence pulses written to indoor bike data
+unsigned long lg_cadence_counter_csc = 0;      // The previous amount of cadence pulses wirtten to CSC measurement
+unsigned long lg_cadence_timer_ibd = 0;        // The previous time written to ibd
+unsigned long lg_cadence_timer_csc = 0;        // The previous time written to csc
+unsigned int int_current_cadence = 0;     // Global variable to hold the calculated cadence
+unsigned int int_current_power = 0;       // Global variable to hold the calculated power
+
+// Spindown variables
+int int_buttonVal = 0;
+volatile long lg_buttonStartMillis;
+volatile long lg_spindownStartMillis;
+volatile long lg_spindownMillis = 13500; // default spindown  13 seconds, tyre relatively loose - measurements were done with 9 seconds from 50 to 0
+int int_spindownPhase = 0; 
+
+
+
+
+/** 
+ * The Fitness Machine Control Point data type structure 
+ * 
+ */
+#define FMCP_DATA_SIZE 19 // Control point consists of 1 opcode (byte) and maximum 18 bytes as parameters
+// This fmcp_data_t structure represents the control point data. The first octet represents the opcode of the request
+// followed by a parameter array of maximum 18 octects
+typedef struct __attribute__( ( packed ) )
+{
+  uint8_t OPCODE;
+  uint8_t OCTETS[ FMCP_DATA_SIZE-1 ];
+} fmcp_data_t;
+
+typedef union // The union type automatically maps the bytes member array to the fmcp_data_t structure member values
+{
+  fmcp_data_t values;
+  uint8_t bytes[ FMCP_DATA_SIZE ];
+} fmcp_data_ut;
+
+fmcp_data_ut fmcpData;
+volatile long lastControlPointEvent = 0;
+long previousControlPointEvent = 0;
+
+#define SERVICE_UUID        "00001826-0000-1000-8000-00805f9b34fb"
+#define FEATURE_UUID        BLEUUID((uint16_t)0x2ACC)
+#define INDOORBIKE_UUID     BLEUUID((uint16_t)0x2AD2)
+#define TRAINSTATUS_UUID    BLEUUID((uint16_t)0x2AD3)
+#define RESLEVEL_UUID       BLEUUID((uint16_t)0x2AD8)
+#define CTRLPOINT_UUID      BLEUUID((uint16_t)0x2AD9)
+#define MACHSTATUS_UUID     BLEUUID((uint16_t)0x2ADA)
+
+BLECharacteristic *pIndoorBikeCharacteristic = NULL;
+BLECharacteristic *pCtrlPointCharacteristic = NULL;
+BLEServer* pServer = NULL;
+
+unsigned char ftmfBuffer[4] = { 0b10000111, 0b01000000, 0, 0 }; //, 0, 0, 0, 0};                            // Features: 0 (Avg speed), 1 (Cadence), 2 (Total distance), 7 (Resistance level), 10 (Heart rate measurement), 14 (Power measurement)
+unsigned char ibdBuffer[8] = { 0, 0, 0, 0, 0, 0, 0, 0} ;
+unsigned char srlrBuffer[4] = { 0, 200, 0, 1};                                                              // Supported Resistance Level Range
+unsigned char ftmsBuffer[2] = { 0, 0};
+unsigned char tsBuffer[2]   = { 0x0, 0x0};                                                                  // Training status: flags: 0 (no string present); Status: 0x00 = Other
+unsigned char ftmcpBuffer[20];
+
+/**
+ * Indoor Bike Data characteristic variables
+ * 
+ */
+const uint16_t flagIntantaneousPower = 64;
+const uint16_t flagInstantaneousCadence = 4;
+const uint8_t  fmcpSetTargetPower = 0x05;
+const uint8_t  fmcpSetIndoorBikeSimulationParameters = 0x11;
+const uint8_t  fmcpResponseCode = 0x80;
+
+/**
+ * PWM Signal
+ */
+//              0     1     2     3     4     5     6    7    8    9    10    11    12    13
+int arr_pwms[14] = {4200, 3300, 2600, 2100, 1600, 1100, 660, 200, 500, 960, 1400, 1880, 2400, 3940}; // Duration of brake PWM signal in microseconds
+int arr_wait[14] = {11,   11,   11,   11,   11,   11,   11,  1,   1,   1,   1,    1,    1,    1};    // Delay in milliseconds for the PWM: 0 in rising part of signal, 10 in falling part of signal
+boolean bln_pwmSignalStarted = false;                                                                // In the loop we need to know whether the pwm signal was started or not
+
+volatile unsigned long lg_syncTime = 4294967295;                                                    // Initialised to max long
+volatile boolean bln_doWait = true;
+
+// watts measured at speeds        15     20      25       30     35      40      45      50      55      60      65      // resistance level
+float arr_PowerCurve[14][11] =  {{18.00, 36.00,  63.00,  92.78, 124.23, 158.27, 170.90, 194.42, 245.43, 276.25, 292.00},  // 0
+                                 {19.86, 39.56,  66.10,  96.92, 124.83, 151.50, 186.39, 214.33, 249.50, 290.00, 308.67},  // 1
+                                 {22.50, 44.47,  72.07, 105.14, 127.92, 165.45, 197.67, 234.31, 258.44, 295.00, 311.25},  // 2
+                                 {24.90, 45.71,  77.71, 111.56, 141.41, 164.00, 212.57, 261.57, 287.00, 322.00, 339.56},  // 3
+                                 {25.93, 52.00,  83.33, 124.85, 160.30, 189.50, 229.77, 268.38, 319.50, 317.00, 371.33},  // 4
+                                 {30.35, 55.46,  93.41, 137.93, 174.71, 214.35, 256.60, 306.00, 341.30, 365.00, 393.00},  // 5
+                                 {33.00, 60.91, 100.86, 144.86, 190.44, 226.00, 280.79, 332.60, 362.60, 392.60, 422.60},  // 6
+                                 {36.23, 64.73, 106.57, 157.61, 203.40, 248.58, 307.23, 352.44, 382.44, 412.44, 442.44},  // 7
+                                 {36.20, 66.31, 110.00, 166.07, 215.92, 266.50, 320.13, 360.13, 400.13, 440.13, 480.13},  // 8
+                                 {38.32, 74.64, 115.07, 179.72, 236.64, 268.80, 348.56, 388.56, 428.56, 468.56, 508.56},  // 9
+                                 {46.20, 67.38, 128.06, 193.33, 253.29, 318.62, 399.60, 439.60, 479.60, 519.60, 559.60},  // 10
+                                 {48.40, 70.90, 140.36, 211.79, 278.92, 358.82, 430.00, 470.00, 510.00, 550.00, 590.00},  // 11
+                                 {47.77, 81.76, 157.06, 226.44, 299.86, 373.27, 445.00, 485.00, 525.00, 565.00, 605.00},  // 12
+                                 {54.62, 85.76, 168.27, 246.64, 327.58, 405.75, 475.00, 515.00, 555.00, 595.00, 635.00}}; // 13  
+
+// actual speed while measiuring   15     20     25     30     35     40     45     50      55    60      65     // resistance level
+float arr_SpeedCurve[14][11] = {{15.00, 20.00, 25.00, 29.74, 35.84, 40.16, 44.70, 49.38, 54.98, 59.10, 65.00},  // 0
+                                {15.50, 20.08, 24.86, 30.83, 35.97, 40.48, 46.52, 51.26, 56.57, 61.62, 63.29},  // 1
+                                {15.80, 19.99, 25.02, 30.67, 34.94, 40.77, 46.30, 51.88, 56.55, 60.00, 64.50},  // 2
+                                {16.00, 19.92, 24.87, 30.41, 34.93, 40.23, 45.43, 50.79, 56.25, 60.00, 64.20},  // 3
+                                {15.79, 19.98, 24.72, 30.44, 34.96, 39.42, 44.86, 50.44, 57.00, 57.61, 64.86},  // 4
+                                {16.09, 19.96, 24.64, 30.39, 35.71, 39.91, 44.54, 50.70, 56.18, 60.00, 64.26},  // 5
+                                {16.09, 19.97, 24.61, 30.00, 34.51, 38.54, 44.78, 50.79, 55.00, 60.00, 65.00},  // 6
+                                {16.62, 19.91, 24.52, 29.82, 34.36, 39.20, 44.93, 50.74, 55.00, 60.00, 65.00},  // 7
+                                {16.77, 19.69, 24.54, 30.22, 34.97, 39.79, 45.35, 50.00, 55.00, 60.00, 65.00},  // 8
+                                {16.82, 20.15, 24.13, 30.15, 35.06, 38.75, 44.55, 50.00, 55.00, 60.00, 65.00},  // 9
+                                {16.94, 19.37, 24.43, 30.06, 34.66, 38.72, 44.85, 50.00, 55.00, 60.00, 65.00},  // 10
+                                {17.03, 19.20, 24.52, 29.70, 34.36, 39.57, 45.00, 50.00, 55.00, 60.00, 65.00},  // 11
+                                {16.98, 19.59, 24.88, 29.83, 34.64, 39.14, 45.00, 50.00, 55.00, 60.00, 65.00},  // 12
+                                {16.99, 19.46, 24.67, 29.71, 34.32, 38.86, 45.00, 50.00, 55.00, 60.00, 65.00}}; // 13  
+
+// General variables
+long lg_current_millis;
+
+bool bln_ZwiftControlled = false;
+bool bln_wasZwiftControlled = false;
+
+// HTML web page to handle input fields 
+
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE HTML><html><head>
+  <title>SmartReCycle Tacx1680</title>
+    <link rel="stylesheet"
+      href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css"
+      integrity="sha384-JcKb8q3iqJ61gNV9KGb8thSsNjpSL0n8PARn9HuZOnIxN0hoP+VmmDGMN5t9UJ0Z"
+      crossorigin="anonymous"/>
+
+  <meta name="viewport" content="width=device-width, initial-scale=1", shrink-to-fit=no">
+  </head><body>
+  <div class="btn-group">
+    <a href="/" class="btn btn-primary active">Status</a>
+    <a href="set_html" class="btn btn-primary">Set</a>
+    <a href="spindown_html" class="btn btn-primary">Spindown</a>
+  </div>
+  <p>&nbsp;
+  <div class="codesection">
+  <div class="container">
+  <br>
+  <main class="main">
+  <iframe src="/status" title="Current Status" id="status" frameborder="0" height="200">
+  </iframe>
+  </main>
+  </div>
+  </div>
+  <div class="footer text-center mt-3">
+    Powered by SmartReCycle Tacx1680
+  </div>    <!-- end container -->
+  <!-- JS, Popper.js, and jQuery -->
+  <script
+    src="https://code.jquery.com/jquery-3.5.1.slim.min.js"
+    integrity="sha384-DfXdz2htPH0lsSSs5nCTpuj/zy4C+OGpamoFVy38MVBnE+IbbVYUew+OrCXaRkfj"
+    crossorigin="anonymous">
+  </script>
+  <script
+    src="https://cdn.jsdelivr.net/npm/popper.js@1.16.1/dist/umd/popper.min.js"
+    integrity="sha384-9/reFTGAW83EW2RDu2S0VKaIzap3H66lZH81PoYlFhbGU+6BZp6G7niu735Sk7lN"
+    crossorigin="anonymous">
+  </script>
+  <script
+    src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.min.js"
+    integrity="sha384-B4gt1jrGC7Jh4AgTPSdUtOBvfO8shuf57BaghqFfPlYxofvL8/KUEfYiJOMMV+rV"
+    crossorigin="anonymous">
+  </script>
+</body></html>)rawliteral";
+
+
+const char set_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE HTML><html><head>
+  <title>SmartReCycle Tacx1680</title>
+    <link rel="stylesheet"
+      href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css"
+      integrity="sha384-JcKb8q3iqJ61gNV9KGb8thSsNjpSL0n8PARn9HuZOnIxN0hoP+VmmDGMN5t9UJ0Z"
+      crossorigin="anonymous"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1", shrink-to-fit=no">
+  </head><body>
+  <div class="btn-group">
+    <a href="/" class="btn btn-primary">Status</a>
+    <a href="set_html" class="btn btn-primary active">Set</a>
+    <a href="spindown_html" class="btn btn-primary">Spindown</a>
+  </div>
+  <br>&nbsp;
+  <div class="codesection">
+  <div class="container">
+  <main class="main">
+  <form action="/set_html">
+  <div class="form-group">
+    <label for="pwm_input">Reistance (0..13)</label>
+    <input type="number" min="0" max="13" class="form-control" name="pwm_input" id="pwm_input" aria-describedby="Pwm" value="%PWMPLACEHOLDER%">
+  </div>
+  </form>
+  <div class="form-group">
+    <table>
+      <tr>
+        <td>
+          <form action="/set_html">
+            <input type="hidden" name="pwm_minus1" value="pwm_minus1">
+            <button type="submit" class="btn btn-outline-primary">Resist. - 1</button>
+          </form>
+        </td>
+        <td>
+          <form action="/set_html">
+            <input type="hidden" name="pwm_plus1" value="pwm_plus1">
+            &nbsp;
+            <button type="submit" class="btn btn-outline-primary">Resist. + 1</button>
+          </form>
+        </td>
+        <td>
+          <form action="/set_html">
+            <input type="hidden" name="pwm_input" value="0">
+            &nbsp;
+            <button type="submit" class="btn btn-outline-primary">Resist. Low</button>
+          </form>
+        </td>
+      </tr>
+    </table>
+  </div>
+  <p>
+  <form action="/set_html">
+  <div class="form-group">
+    <label for="target_input">Target Power (0..500)</label>
+    <input type="number" min="0" max="500" class="form-control" name="target_input" id="target_input" aria-describedby="Pwm" value="%TARGETPLACEHOLDER%">
+   </div>
+  </form>
+  <form action="/set_html">
+  <div class="form-group">
+     <label for="target_input">Fake Speed (0..60)</label>
+    <input type="number" min="0" max="60" class="form-control" name="speed_input" id="speed_input" aria-describedby="Pwm" value="%SPEEDPLACEHOLDER%">
+  </div>
+  </form><br>
+  <form action="/set_html">
+  <div class="form-group">
+   <input type="hidden" name="reset" value="reset">
+   <button type="submit" class="btn btn-outline-primary">Reset All Input</button>
+  </div>
+  </form>
+  <p>
+  <iframe src="/status" title="Current Status" id="status" frameborder="0" height="200>
+  </iframe>
+  </main>
+  </div>
+  </div>
+  <div class="footer text-center mt-3">
+    Powered by SmartReCycle Tacx1680
+  </div>     <!-- end container -->
+  <!-- JS, Popper.js, and jQuery -->
+  <script
+    src="https://code.jquery.com/jquery-3.5.1.slim.min.js"
+    integrity="sha384-DfXdz2htPH0lsSSs5nCTpuj/zy4C+OGpamoFVy38MVBnE+IbbVYUew+OrCXaRkfj"
+    crossorigin="anonymous">
+  </script>
+  <script
+    src="https://cdn.jsdelivr.net/npm/popper.js@1.16.1/dist/umd/popper.min.js"
+    integrity="sha384-9/reFTGAW83EW2RDu2S0VKaIzap3H66lZH81PoYlFhbGU+6BZp6G7niu735Sk7lN"
+    crossorigin="anonymous">
+  </script>
+  <script
+    src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.min.js"
+    integrity="sha384-B4gt1jrGC7Jh4AgTPSdUtOBvfO8shuf57BaghqFfPlYxofvL8/KUEfYiJOMMV+rV"
+    crossorigin="anonymous">
+  </script>
+</body></html>)rawliteral";
+
+const char spindown_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE HTML><html><head>
+  <title>SmartReCycle Tacx1680</title>
+    <link rel="stylesheet"
+      href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css"
+      integrity="sha384-JcKb8q3iqJ61gNV9KGb8thSsNjpSL0n8PARn9HuZOnIxN0hoP+VmmDGMN5t9UJ0Z"
+      crossorigin="anonymous"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1", shrink-to-fit=no">
+  </head><body>
+  <div class="btn-group">
+    <a href="/" class="btn btn-primary">Status</a>
+    <a href="set_html" class="btn btn-primary">Set</a>
+    <a href="spindown_html" class="btn btn-primary active">Spindown</a>
+  </div>
+  <br>&nbsp;
+  <div class="codesection">
+  <div class="container">
+  <main class="main">
+  Spindown milliseconds: %SPINDOWNPLACEHOLDER%
+  <p>
+  %SPINDOWNSAVEPLACEHOLDER%
+  <form action="/spindown_html">
+  <div class="form-group">
+    <input type="hidden" name="spindown_reset" value="spindown_reset">
+    <button type="submit" class="btn btn-outline-primary">Reset Spindown to 13500 ms</button>
+  </div>
+  </form>
+  <form action="/spindown_html">
+  <div class="form-group">
+    <input type="hidden" name="spindown_start" value="spindown_start">
+    <button type="submit" class="btn btn-outline-primary">Start Spindown from 55km/h -> 0</button>
+  </div>
+  </form>
+  <p>
+  <iframe src="/status" title="Current Status" id="status" frameborder="0" height="200>
+  </iframe>
+  </main>
+  </div>
+  </div>
+  <div class="footer text-center mt-3">
+    Powered by SmartReCycle Tacx1680
+  </div>
+  <script
+    src="https://code.jquery.com/jquery-3.5.1.slim.min.js"
+    integrity="sha384-DfXdz2htPH0lsSSs5nCTpuj/zy4C+OGpamoFVy38MVBnE+IbbVYUew+OrCXaRkfj"
+    crossorigin="anonymous">
+  </script>
+  <script
+    src="https://cdn.jsdelivr.net/npm/popper.js@1.16.1/dist/umd/popper.min.js"
+    integrity="sha384-9/reFTGAW83EW2RDu2S0VKaIzap3H66lZH81PoYlFhbGU+6BZp6G7niu735Sk7lN"
+    crossorigin="anonymous">
+  </script>
+  <script
+    src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.min.js"
+    integrity="sha384-B4gt1jrGC7Jh4AgTPSdUtOBvfO8shuf57BaghqFfPlYxofvL8/KUEfYiJOMMV+rV"
+    crossorigin="anonymous">
+  </script>
+</body></html>)rawliteral";
+
+
+
+// Replaces placeholder with button section in your web page
+String placeholder = "";
+String processor(const String& var){
+  if(var == "PLACEHOLDER"){
+    String output_text = "<h1>Current Status</h1><p>";
+    output_text += "Watts Acc: " + String(int_watts_acc) + "<br>";
+    output_text += "Watts pace: " + String(int_watts) + "<br>";
+    output_text += "Speed: " + String(fl_current_speed) + "<br>";
+    output_text += "fl_grade: " + String(fl_grade) + "<br>";
+    output_text += placeholder;
+    return output_text;
+  }
+  else if(var == "PWMPLACEHOLDER"){
+    String output_text = String(int_currentPwm);
+    return output_text;
+  }
+  else if(var == "TARGETPLACEHOLDER"){
+    String output_text = String(fl_targetWatts);
+    return output_text;
+  }
+  else if(var == "SPEEDPLACEHOLDER"){
+    String output_text = String(fl_current_speed);
+    return output_text;
+  }
+  else if(var == "SPINDOWNPLACEHOLDER"){
+    String output_text = String(lg_spindownMillis);
+    return output_text;
+  }
+  else if(var == "SPINDOWNSAVEPLACEHOLDER"){
+    if (int_spindownPhase==1){
+      String output_text = "<form action=\"/spindown_html\">";
+      output_text += "<div class=\"form-group\">";
+      output_text += "<input type=\"hidden\" name=\"spindown_save\" value=\"spindown_save\">";
+      output_text += "<button type=\"submit\" class=\"btn btn-outline-primary\">Save Spindown Result</button>";
+      output_text += "</div></form>";
+      return output_text;
+    }
+  }
+  return String();
+}
+
+/**
+ * Control the LED's
+ * One green and red LED
+ * Green LED control
+ * ZWIFT connected: Green LED on
+ * Spindown start: Green LED slow flash
+ * Spindown stop pedalling: Green LED fast flash
+ * Cable not connected (no sync signal): Red LED on
+ * Power greater >1000: Red LED flash
+ */
+class LED{
+  public:
+    LED (int p){
+      pinMode(p, OUTPUT);
+      pin = p;
+    }
+    void shine(void){
+      if (mode==0){
+        digitalWrite(pin, LOW); 
+      }
+      else if (mode==1){
+        digitalWrite(pin, HIGH);
+      }
+      else if (mode==2){
+        if ((millis() / 1000) % 2){
+          digitalWrite(pin, HIGH);
+        }
+        else{
+          digitalWrite(pin, LOW);
+        }
+      }
+      else if (mode==3){
+        if ((millis() / 300) % 2){
+          digitalWrite(pin, HIGH);
+        }
+        else{
+          digitalWrite(pin, LOW);
+        }
+      }
+    }
+    void set_mode(int m){
+      mode = m;
+    }
+  private:
+    int pin;
+    int mode = 0; //0 = off, 1 = constant, 2 = flash, 3 = fast flash
+};
+
+// create global instances for red and green LED
+LED led_red(RED);
+LED led_green(GREEN);
+
+/**
+ * Control Point Callback
+ */
+class ControlPointCallback: public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *pCtrlPointCharacteristic) {
+    uint8_t *data = pCtrlPointCharacteristic->getData();
+    
+    if (data[0] == fmcpSetIndoorBikeSimulationParameters){
+      //downhill
+      if (!bln_appControlled){ // set values unless trainer controlled by App, e.g. spindown
+        if (data[4]>200){
+          fl_grade = (data[3]-256 - (255-data[4])*256) * 0.02; // need to double the fl_grade in downhill - tested in Zwift
+        }
+        //uphill
+        else{
+          fl_grade = (data[3] + data[4]*256) * 0.02;
+        }
+        fl_wind_speed = data[1] + (data[2] * 256);
+        fl_crr = data[4];
+        fl_cw = data[5];
+  
+        //reset the target watt
+        fl_targetWatts = 0;
+      }
+      ftmcpBuffer[0] = fmcpResponseCode;
+      ftmcpBuffer[1] = fmcpData.values.OPCODE;
+      ftmcpBuffer[2] = 0x01;
+      pCtrlPointCharacteristic->setValue(ftmcpBuffer, 3);
+    }
+    else if (data[0] == fmcpSetTargetPower){
+      if (  bln_appControlled == false){ // set values unless trainer controlled by App, e.g. spindown
+        fl_targetWatts = data[1] + (data[2] * 256);
+      }  
+      ftmcpBuffer[0] = fmcpResponseCode;
+      ftmcpBuffer[1] = fmcpData.values.OPCODE;
+      ftmcpBuffer[2] = 0x01;
+      pCtrlPointCharacteristic->setValue(ftmcpBuffer, 3);
+    }
+    lastControlPointEvent = millis(); 
+  }
+};
+
+/**
+ * Server Callback`
+ */
+class MyServerCallbacks: public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+      bln_ZwiftControlled = true;
+      led_green.set_mode(1); // switch on green led 
+    };
+
+    void onDisconnect(BLEServer* pServer) {
+      bln_ZwiftControlled = false;
+      led_green.set_mode(0); // switch off green led 
+    }
+};
+
+/**
+ * Resets the device, called in case of sync error 
+ * 
+ */
+void(* resetFunc) (void) = 0;
+
+void writeIndoorBikeDataCharacteristic() {
+
+  if(bln_ZwiftControlled){
+    ibdBuffer[0] = 0x00 | flagInstantaneousCadence | flagIntantaneousPower; // More Data = 0 (instantaneous speed present), bit 2: instantaneous cadence present
+    ibdBuffer[1] = 0;
+  
+    int s = round((fl_current_speed * 3.6 * 100)); // fl_current_speed is m/s. IndoorBikeData needs km/h in resolution of 0.01
+    ibdBuffer[2] = s & 0xFF; // Instantaneous Speed, uint16
+    ibdBuffer[3] = (s >> 8) & 0xFF;
+
+    // Cadence not supported, send cadence = 80
+    int int_current_cadence = 160; //calculate_cadence(cadence_counter, lg_cadence_counter_ibd, lg_cadence_timer, lg_cadence_timer_ibd) * 2; // Cadence should be multiplied by 2
+    ibdBuffer[4] = char((int)round(int_current_cadence)) & 0xFF; // Instantaneous Cadence, uint16
+    ibdBuffer[5] = char(((int)round(int_current_cadence)) >> 8) & 0xFF;
+  
+    //fl_crr = 0.005; 
+    
+    // use calculated int_watts_acc from trainer formula
+    int_current_power = int_watts_acc;
+    ibdBuffer[6] = char((int)round(int_current_power)) & 0xFF; // Instantaneous Power, uint16
+    ibdBuffer[7] = char(((int)round(int_current_power) >> 8)) & 0xFF;
+    
+    pIndoorBikeCharacteristic->setValue(ibdBuffer, 8);
+    pIndoorBikeCharacteristic->notify();
+  }
+}
+
+
+/**
+ * Generates the brake PWM signal according to the settings of the requested resistance
+ */
+void writePWM() {
+  unsigned long n = micros();
+  if (!bln_pwmSignalStarted && !bln_doWait && (n >= lg_syncTime + arr_wait[int_currentPwm]*1000)) {
+      digitalWrite(PWM, HIGH);
+      bln_pwmSignalStarted = true;
+      bln_doWait = true;
+  }
+  if (bln_pwmSignalStarted && (n >= lg_syncTime + arr_wait[int_currentPwm]*1000 + arr_pwms[int_currentPwm])) {
+      digitalWrite(PWM, LOW);
+      bln_pwmSignalStarted = false;
+      bln_doWait = true;
+  }
+}
+
+/**
+ * Map the fl_grade to the resistance level
+ * 
+ * @return int The new value for the int_currentPwm
+ */
+int setTrainerResistance(float fl_wind_speed, float fl_grade, float fl_crr, float fl_cw, float iv_target) {
+
+  float targetDeltaFactor = 0.0;
+  int targetShiftGears = 0;
+
+  if (iv_target > 0){
+    if (((targetDeltaFactor=iv_target-int_watts)/iv_target) > TARGETSHIFT_FACTOR && int_currentPwm < 13){
+      targetShiftGears = int((iv_target-int_watts)/iv_target/TARGETSHIFT_FACTOR);
+      if (targetShiftGears > 0){
+        int_currentPwm = int_currentPwm + targetShiftGears;
+      }
+    }
+    else if (((targetDeltaFactor=int_watts-iv_target)/int_watts) > TARGETSHIFT_FACTOR && int_currentPwm > 0){
+      targetShiftGears = int((int_watts-iv_target)/int_watts/TARGETSHIFT_FACTOR);
+      int_currentPwm = int_currentPwm - targetShiftGears;
+    }
+   
+    if (int_currentPwm > 13) int_currentPwm = 13;
+    if (int_currentPwm < 0) int_currentPwm = 0;
+    return int_currentPwm;
+  }
+  else{
+    
+    // Todo: calculate the correct value to set the brake level
+    if (fl_grade < -4) return 0;
+    else if (fl_grade > 9) return 13;
+    else return map( (int)fl_grade, -4, 9, 0, 13);
+  }
+}
+
+
+/**
+ * Handles the synchronization signal:
+ *   - sets the time in microseconds of the signal for the timing of the pwm
+ *   - indicates that the signal can be generated if needed
+ */
+void syncInterrupt() {
+  lg_syncTime = micros();
+  bln_doWait = false;
+}
+
+void speedInterrupt() {
+  lg_speed_counter++;
+  lg_speed_timer = millis();
+}
+
+/**
+ * Calculate and return the current speed
+ */
+double calculate_speed(unsigned long current_counter, unsigned long previous_counter, unsigned long current_timer, unsigned long previous_timer) {
+
+  double calculated_speed = 0.0;
+  if ((current_timer == previous_timer) || ((current_timer - previous_timer) > 5000)) {
+    led_red.set_mode(1); // switch on red led 
+    return 0.0;
+  } else {
+    calculated_speed = (current_counter - previous_counter) * BRAKE_SIZE * 3.6 / (double)(current_timer - previous_timer);
+    led_red.set_mode(0); // switch off red led
+    return calculated_speed;
+  }
+}
+
+/**
+ * Calculates the power based on the measurement points
+*/
+void calculate_power(){
+  for (int i=0; i<11; i++){
+    if(fl_current_speed > arr_SpeedCurve[int_currentPwm][i] && fl_current_speed < arr_SpeedCurve[int_currentPwm][i+1]){
+      int_watts = ((fl_current_speed-arr_SpeedCurve[int_currentPwm][i])*(arr_PowerCurve[int_currentPwm][i+1]-arr_PowerCurve[int_currentPwm][i])/(arr_SpeedCurve[int_currentPwm][i+1]-arr_SpeedCurve[int_currentPwm][i]))+arr_PowerCurve[int_currentPwm][i];
+      break;
+    }
+    else if(i==0 && fl_current_speed < arr_SpeedCurve[int_currentPwm][i]){
+      int_watts = fl_current_speed * arr_PowerCurve[int_currentPwm][i]/arr_SpeedCurve[int_currentPwm][i];
+      break;
+    }
+    else if(i==10 && fl_current_speed > arr_SpeedCurve[int_currentPwm][i]){
+      int_watts = (fl_current_speed-arr_SpeedCurve[int_currentPwm][i])/(arr_SpeedCurve[int_currentPwm][i]-arr_SpeedCurve[int_currentPwm][i-1])*(arr_PowerCurve[int_currentPwm][i]-arr_PowerCurve[int_currentPwm][i-1])+arr_PowerCurve[int_currentPwm][i];
+      break;
+    }
+    else if(fl_current_speed == arr_SpeedCurve[int_currentPwm][i]){
+      int_watts = arr_PowerCurve[int_currentPwm][i];
+      break;
+    } 
+  }
+
+  // time factor -cold tyre during first X minutes, decrease the warmup factor linearly
+  if (lg_current_millis < lg_warmup_millis){
+    fl_time_factor = (float(lg_warmup_millis)-float(lg_current_millis))/float(lg_warmup_millis) * float(WARMUP_FACTOR) + 1;
+    int_watts = int_watts * fl_time_factor;
+  }
+  // spindown factor
+  //Formula: int_watts = (baseline - ((spinDownSeconds - 14) * speed/5))
+  int_watts = int_watts - ((lg_spindownMillis - SPINDOWNDEFAULT)/1000 * fl_current_speed / 3);
+
+  // Kickr Adjustment Factor (Kickr reporting 5% more than tested Power2Max Crank
+  int_watts = int_watts * fl_adj_factor;
+  
+  // acceleration
+  int_watts_acc = int_watts  + (fl_current_speed - fl_previous_speed)/3.6 * WEIGHT_ACC; 
+
+  // sets int_watts to 0 if negative
+  if(int_watts_acc < 0){
+    int_watts_acc = 0; 
+  }
+
+  //if int_watts too high the system is out of sync. Happening very rarely - reboot the device in this case
+  if (int_watts > 2000){
+    resetFunc();    
+  }
+}
+
+
+/**
+ * Handle the spin down phases
+ * Phsae 5: Spindown started, accelerating to reach 53 km/h
+ * Phase 4: 50km/h reached, spinning down
+ * Phase 3: Waiting for speed to drop under 10 km/h
+ * max spindown duration: 50 seconds
+*/
+void spinDown(){
+  // spindown handling
+  int_buttonVal = digitalRead(BUTTON);
+  if (int_buttonVal==LOW){
+    lg_buttonStartMillis = millis();
+    int_spindownPhase = 5;
+    led_green.set_mode(2);
+    bln_appControlled = true;
+  }
+
+  if (int_spindownPhase > 1 && lg_current_millis < (lg_buttonStartMillis + 50000) ) {  // spindown mode for maxium 50 seconds, currently on
+      // phase 5: Spindown started but not 50km/h reached yet
+      if ( int_spindownPhase==5){
+        led_green.set_mode(2); // slow flashing
+        if (fl_previous_speed>53.00){
+          int_spindownPhase = 4;
+        }
+      }
+    // phase 4: 50 km/h reached, arr_waiting to drop under 50 - stop pedalling
+      else if (int_spindownPhase==4){
+        led_green.set_mode(3); // fast flashing
+        if (fl_previous_speed<50.00){
+          int_spindownPhase = 3;
+          
+          //                     start time    -  brought forward to the moment where it was 50km/h - assuming pace is dropping by 5km/h per second
+          lg_spindownStartMillis = lg_current_millis - (50.00 - fl_previous_speed)*1000/5;
+        }
+      }
+  
+    // Speed dropped under 50 km/h, arr_waiting to drop under 10km/h - stop pedalling
+      else if (int_spindownPhase==3){
+        led_green.set_mode(3); // fast flashing
+        if (fl_previous_speed < 10.00){
+          
+          //               end time           brought forward by the moment where it was 5km/h - assuming pace is dropping by 1.5km/h per second
+          lg_spindownMillis = lg_current_millis - ((5.00 - fl_previous_speed)*1000/1.5) - lg_spindownStartMillis;
+          if (fl_time_factor > 1.05){ // still in first half of warmup, add a second
+            lg_spindownMillis = lg_spindownMillis + 1000; 
+          }
+          lg_buttonStartMillis = 0;
+          int_spindownPhase = 1; //int_spindownPhase = 1: Successful spindown completed
+          if (bln_ZwiftControlled){
+            led_green.set_mode(1); // show green LED, continue Zwifting  
+          }
+          else{
+            led_green.set_mode(0); // stop green LED
+          }
+          bln_appControlled = false;
+        }
+      }
+  }
+  else if (int_spindownPhase > 1){     ///spindown mode expired, switch it off
+    lg_buttonStartMillis = 0;
+    int_spindownPhase = 0;
+    if (bln_ZwiftControlled){
+      led_green.set_mode(1); // show green LED, continue Zwifting  
+    }
+    else{
+      led_green.set_mode(0); // stop green LED
+    }
+    bln_appControlled = false;
+  }
+}
+
+/*
+ *boolean isNumber
+  helper method to check if a string is a number
+*/
+boolean isNumber(String str){
+  for(byte i=0;i<str.length();i++){
+    if(isDigit(str.charAt(i))) return true;
+  }
+  return false;
+}
+
+
+/*
+ *void notFound
+  Web Server error page
+*/
+void notFound(AsyncWebServerRequest *request) {
+  request->send(404, "text/plain", "Not found");
+}
+
+/**
+ * Setup Method 
+ * Initialize Bluetooth, Wifi, Sensors
+ */
+void setup() {
+
+  Serial.begin(115200);
+  Serial.println("setup()");
+
+  led_red.set_mode(0); 
+  led_green.set_mode(0);
+  led_red.shine();
+  led_green.shine();
+
+  pinMode(SYNC, INPUT);
+  pinMode(PWM, OUTPUT);
+  pinMode(BUTTON, INPUT_PULLUP);    // Setting the button pin as an input which uses an internal pullup resistor on the Uno board
+
+  // read the saved spindown value from the memory
+  if (!EEPROM.begin(EEPROM_SIZE))
+  {
+    Serial.println("failed to initialise EEPROM"); 
+  }
+  long lg_spindownSaved = 0;
+  EEPROM.get(EEPROM_ADDR_SPIN, lg_spindownSaved);
+
+  if (lg_spindownSaved>1000){
+   lg_spindownMillis = lg_spindownSaved;
+  }
+  else{
+   lg_spindownMillis = SPINDOWNDEFAULT;
+  }
+
+  fl_adj_factor = ADJ_FACTOR; // set the default adjustment factor
+
+  // set up the sensors 
+  bln_pwmSignalStarted = false;
+  int_currentPwm = 4; // start with fl_grade = 0%
+  digitalWrite(PWM, LOW);
+  attachInterrupt(digitalPinToInterrupt(SYNC), syncInterrupt, RISING);
+
+  // Speed  handling
+  pinMode(SPEED, INPUT);
+  attachInterrupt(digitalPinToInterrupt(SPEED), speedInterrupt, FALLING);
+
+  // Initialize Bluetooth
+  BLEDevice::init("Tacx1680");
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+  BLECharacteristic *pFeatureCharacteristic = pService->createCharacteristic(
+                                         FEATURE_UUID,
+                                         BLECharacteristic::PROPERTY_READ 
+                                       );
+  pFeatureCharacteristic->setValue(ftmfBuffer, 4);
+  pIndoorBikeCharacteristic = pService->createCharacteristic(
+                                         INDOORBIKE_UUID,
+                                         BLECharacteristic::PROPERTY_NOTIFY 
+                                       );
+  pIndoorBikeCharacteristic->addDescriptor(new BLE2902());
+  ibdBuffer[0] = 0;   ibdBuffer[1] = 0;   ibdBuffer[2] = 0;   ibdBuffer[3] = 0;  ibdBuffer[4] = 0;  ibdBuffer[5] = 0;  ibdBuffer[6] = 0;  ibdBuffer[7] = 0;
+  pIndoorBikeCharacteristic->setValue(ibdBuffer, 8);
+  BLECharacteristic *pResLevelCharacteristic = pService->createCharacteristic(
+                                         RESLEVEL_UUID,
+                                         BLECharacteristic::PROPERTY_READ 
+                                       );
+  pResLevelCharacteristic->setValue(srlrBuffer, 8);
+  BLECharacteristic *pMachStatusCharacteristic = pService->createCharacteristic(
+                                         MACHSTATUS_UUID,
+                                         BLECharacteristic::PROPERTY_NOTIFY
+                                       );
+  pMachStatusCharacteristic->addDescriptor(new BLE2902());
+  pMachStatusCharacteristic->setValue(ftmsBuffer, 2);
+  pCtrlPointCharacteristic = pService->createCharacteristic(
+                                         CTRLPOINT_UUID,
+                                         BLECharacteristic::PROPERTY_WRITE
+                                       );
+  pCtrlPointCharacteristic->addDescriptor(new BLE2902());
+  pCtrlPointCharacteristic->setValue(ftmsBuffer, 2);
+  pCtrlPointCharacteristic->setCallbacks(new ControlPointCallback());
+  BLECharacteristic *pTrainStatusCharacteristic = pService->createCharacteristic(
+                                         TRAINSTATUS_UUID,
+                                         BLECharacteristic::PROPERTY_NOTIFY | 
+                                         BLECharacteristic::PROPERTY_READ
+                                       );
+  pTrainStatusCharacteristic->setValue(tsBuffer, 2);
+  pService->start();
+  BLEAdvertising *pAdvertising = pServer->getAdvertising();
+  pAdvertising->addServiceUUID(BLEUUID(SERVICE_UUID)); 
+  pAdvertising->start();
+
+// Connect to Wii
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(SSID, PASSWORD);
+  if (WiFi.waitForConnectResult() != WL_CONNECTED) {
+    Serial.println("WiFi Connection failed - continue without Wifi");
+  }
+  else{
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+  }
+
+  // Send web page with input fields to client
+  webServer.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send_P(200, "text/html", index_html, processor);  
+  });
+
+  webServer.on("/set_html", HTTP_GET, [] (AsyncWebServerRequest *request) {
+    String inputMessage;
+    String inputParam;
+    // GET pwm_input value on <ESP_IP>/get?pwm_input=<inputMessage>
+    if (request->hasParam(PWM_INPUT)) {
+      inputMessage = request->getParam(PWM_INPUT)->value();
+      if (isNumber(inputMessage)){
+        if(inputMessage.toInt()>=0 && inputMessage.toInt()<=13){
+          int_currentPwm = inputMessage.toInt();
+          fl_grade = int_currentPwm - 4;
+          fl_targetWatts = 0;
+          bln_appControlled = true;
+        }
+      }
+      inputParam = PWM_INPUT;
+    }
+    // GET PWM_PLUS1 value
+    else if (request->hasParam(PWM_PLUS1)) {
+      inputMessage = request->getParam(PWM_PLUS1)->value();
+      inputParam = PWM_PLUS1;
+      if (int_currentPwm<13){
+        int_currentPwm++;
+        fl_grade = int_currentPwm - 4;
+        fl_targetWatts = 0;
+      }
+      bln_appControlled = true;
+    }
+    // GET PWM_MINUS1 value
+    else if (request->hasParam(PWM_MINUS1)) {
+      inputMessage = request->getParam(PWM_MINUS1)->value();
+      inputParam = PWM_MINUS1;
+      if (int_currentPwm>0){
+        int_currentPwm--;
+        fl_grade = int_currentPwm - 4;
+        fl_targetWatts = 0;
+      }
+      bln_appControlled = true;
+    }
+    // GET target_input value on <ESP_IP>/get?target_input=<inputMessage>
+    else if (request->hasParam(TARGET_INPUT)) {
+      inputMessage = request->getParam(TARGET_INPUT)->value();
+      inputParam = TARGET_INPUT;
+      if (isNumber(inputMessage)){
+        if(inputMessage.toInt()>0 && inputMessage.toInt()<1000){
+          fl_targetWatts = inputMessage.toInt();
+          bln_appControlled = true;
+        }
+      }
+    }
+    else if (request->hasParam(SPEED_INPUT)) {
+      inputMessage = request->getParam(SPEED_INPUT)->value();
+      inputParam = SPEED_INPUT;
+      if (isNumber(inputMessage)){
+        if(inputMessage.toInt()>0 && inputMessage.toInt()<70){
+          fl_current_speed = inputMessage.toInt();
+          bln_appControlled = true;
+          bln_speedControlled = true;
+          Serial.println(fl_current_speed);
+        }
+        else if(inputMessage.toInt()==0){
+          bln_speedControlled = false;
+          fl_current_speed = inputMessage.toInt();
+        }
+      }
+    }
+    else if (request->hasParam(RESET)) {
+      inputMessage = request->getParam(RESET)->value();
+      inputParam = RESET;
+      int_currentPwm = 0;
+      fl_current_speed = 0;
+      int_spindownPhase = 0;
+      fl_targetWatts = 0;
+      bln_appControlled = false;
+      bln_speedControlled = false;
+    }
+    else {
+      inputMessage = "No message sent";
+      inputParam = "none";
+    }
+    placeholder = "HTTP GET request sent to your ESP on input field (" + inputParam + ") with value: " + inputMessage + "<br><a href=\"/\">Return to Home Page</a>";
+    request->send_P(200, "text/html", set_html, processor);
+  });
+
+  webServer.on("/spindown_html", HTTP_GET, [](AsyncWebServerRequest *request){
+    // GET SPINDOWN_START value on <ESP_IP>/get?SPINDOWN_START=<inputMessage>
+    if (request->hasParam(SPINDOWN_START)) {
+      int_spindownPhase = 5;
+      lg_buttonStartMillis = millis();
+      int_currentPwm = 0;
+      fl_grade = int_currentPwm - 4;
+      fl_targetWatts = 0;
+      bln_appControlled = true;
+    }
+    else if (request->hasParam(SPINDOWN_SAVE)) {
+      //int spindownSave = lg_spindownMillis/100; // divide by 100 as max. value in EEPROM is 255
+      EEPROM.put(EEPROM_ADDR_SPIN, lg_spindownMillis); 
+      if (EEPROM.commit()) {
+        Serial.println("EEPROM successfully committed!");
+      } else {
+        Serial.println("ERROR! EEPROM commit failed!");
+      }
+      Serial.print("Spindown saved: ");
+      Serial.println(lg_spindownMillis);
+    }
+    else if (request->hasParam(SPINDOWN_RESET)) {
+      int spindownReset = 0;
+      EEPROM.put(EEPROM_ADDR_SPIN, spindownReset); 
+      if (EEPROM.commit()) {
+        Serial.println("EEPROM successfully committed!");
+      } else {
+        Serial.println("ERROR! EEPROM commit failed!");
+      }
+      lg_spindownMillis = SPINDOWNDEFAULT;
+    }
+    request->send_P(200, "text/html", spindown_html, processor);
+  });
+   
+  webServer.on("/status", HTTP_GET, [](AsyncWebServerRequest *request){
+    String status_html = "<!DOCTYPE HTML><html><head>";
+    status_html += "<link rel=\"stylesheet\"";
+    status_html += "href=\"https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css\"";
+    status_html += "integrity=\"sha384-JcKb8q3iqJ61gNV9KGb8thSsNjpSL0n8PARn9HuZOnIxN0hoP+VmmDGMN5t9UJ0Z\"";
+    status_html += "crossorigin=\"anonymous\"/>";
+    status_html += "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"></head>";
+    status_html += "<body>";
+    if (int_spindownPhase>0){
+      if (int_spindownPhase==5){
+        status_html += "Spindown on: <b>Push 55 km/h</b><p>";
+      }
+      else if (int_spindownPhase==4 || int_spindownPhase==3){
+        status_html += "Spindown on: <b>Stop pedalling</b><p>";
+      }
+      else if (int_spindownPhase==1){
+        status_html += "Spindown complete: <b>" + String(lg_spindownMillis) + "</b><p>";
+      }
+      else if (int_spindownPhase==0){
+        status_html += "Default Spindown: <b>" + String(lg_spindownMillis) + "</b><p>";
+      }
+    }
+    status_html += "<table bgcolor=\"#FFA500\" border=\"5\" spacing=\"5\" width=\"100%\" height=\"200\" bordercolor=\"#ffffff\" cellpadding=\"5\" padding=\"5\">";
+    if (bln_appControlled==true){
+    status_html += "<tr><td><b>APP <small>controlled</small></b></td><td>&nbsp;</td></tr>";
+    }
+    else if(bln_ZwiftControlled==true){
+    status_html += "<tr><td><b>ZWIFT <small>controlled</small></b></td><td>&nbsp;</td></tr>";
+    }
+    else{
+      status_html += "<tr><td><b>NOT <small>controlled</small></b></td><td>&nbsp;</td></tr>";
+    }
+    status_html += "<tr><td><b>" + String(int_watts_acc) + "</b> <small>int_watts</small></td><td><b>" + String(int_watts) + "</b> <small>int_watts speed</small></td></tr>";
+    status_html += "<tr><td><b>" + String(fl_current_speed) + "</b> <small>km/h</small></td><td><b>" + String(int_currentPwm) + "</b> <small>Resistance</small></td></tr>";
+    status_html += "</table></body></html>";
+    status_html += "<script language=\"JavaScript\">setTimeout(function(){";
+    status_html += "window.location.reload();";
+    status_html += "}, 1000);";
+    status_html += "</script>";
+    request->send(200, "text/html", status_html);
+  });
+  webServer.onNotFound(notFound);
+  webServer.begin();
+}
+
+
+/**
+ * Main Loop
+ * 
+ */
+void loop() {
+  led_red.shine();
+  led_green.shine(); 
+
+  // generate PWM based on trainer_resistance
+  if ( int_currentPwm >= 0 && int_currentPwm <= 13 ){
+    writePWM();
+  }
+  else{
+    Serial.print("ErrPwm: ");
+    Serial.println(int_currentPwm);
+  }
+  lg_current_millis = millis();
+
+/**
+ * Handle the spindown for up to 50 seconds if button was pressed
+ * 
+ */
+  spinDown();
+
+  // Zwift is connected
+  if (bln_ZwiftControlled || bln_appControlled) {
+/**
+ * Processing every notification interval
+ * 
+ */
+    if (lg_current_millis >= (lg_previous_notification + 1000)) {  // notify Zwift once per second
+      lg_speed_counter_ibd = lg_speed_counter;
+      lg_speed_timer_ibd = lg_speed_timer;
+      lg_cadence_counter_ibd = lg_cadence_counter;
+      lg_cadence_timer_ibd = lg_cadence_timer;
+      lg_previous_notification = millis();
+
+      calculate_power();
+
+      Serial.print(lg_current_millis); Serial.print(";");
+      Serial.print(fl_current_speed); Serial.print(";");
+      Serial.print(int_watts_acc); Serial.print(";");
+      Serial.print(int_watts); Serial.print(";");
+      Serial.print(fl_targetWatts); Serial.print(";");
+      Serial.print(int_currentPwm); Serial.print(";");
+      Serial.print(fl_grade); Serial.print(";");
+      Serial.print(fl_time_factor); Serial.print(";");
+      Serial.print(int_spindownPhase); Serial.print(";");
+      Serial.print(bln_ZwiftControlled); Serial.print(";");
+      Serial.print(bln_appControlled); Serial.print(";");
+      Serial.println(lg_spindownMillis);
+
+      fl_previous_speed = fl_current_speed;    
+
+      writeIndoorBikeDataCharacteristic();
+
+      // Set resistance based on spindown, target power fl_grade, given in int_currentPwm
+      if (int_spindownPhase > 1){
+        int_currentPwm = 0;
+      }
+      else{
+        int_currentPwm = setTrainerResistance(fl_wind_speed, fl_grade, fl_crr, fl_cw, fl_targetWatts);
+      }
+
+      if (int_currentPwm>13){
+        int_currentPwm = 13;
+      }
+      else if (int_currentPwm<0){
+        int_currentPwm = 0;
+      }
+    }// notification interval
+  } //bln_ZwiftControlled
+
+
+  // disconnecting
+  if (!bln_ZwiftControlled && bln_wasZwiftControlled) {
+      Serial.println("disconnecting");
+      delay(500); // give the bluetooth stack the chance to get things ready
+      pServer->startAdvertising(); // restart advertising
+      Serial.println("start advertising");
+      bln_wasZwiftControlled = bln_ZwiftControlled;
+  }
+  // connecting
+  if (bln_ZwiftControlled && !bln_wasZwiftControlled) {
+      Serial.println("connecting");
+      bln_wasZwiftControlled = bln_ZwiftControlled;
+  }
+
+  if (bln_speedControlled==false){
+    fl_current_speed = calculate_speed(lg_speed_counter, lg_speed_counter_ibd, lg_speed_timer, lg_speed_timer_ibd);
+  }
+}
