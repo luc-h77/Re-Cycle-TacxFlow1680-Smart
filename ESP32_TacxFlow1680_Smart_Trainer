@@ -20,25 +20,6 @@
 //EEPROM - save into ESP32 memory
 #include <EEPROM.h>
 
-// web server variables
-const char* SSID = "[WIFI ID}";                     // <== CHANGE this!!! --------------------------------------
-const char* PASSWORD = "{WIFI password]";           // <== CHANGE this!!! --------------------------------------
-const char* PWM_INPUT = "pwm_input";
-const char* TARGET_INPUT = "target_input";
-const char* SPEED_INPUT = "speed_input";
-const char* SPINDOWN_START = "spindown_start";
-const char* SPINDOWN_SAVE = "spindown_save";
-const char* SPINDOWN_RESET = "spindown_reset";
-const char* PWM_PLUS1 = "pwm_plus1";
-const char* PWM_MINUS1 = "pwm_minus1";
-const char* RESET = "reset";
-const char* ADJUSTMENT_INPUT = "adjustment_input";
-const char* WARMUPMIN_INPUT  = "warmupmin_input";
-const char* WARMUPERC_INPUT  = "warmupperc_input";
-
-boolean bln_appControlled = false;
-boolean bln_speedControlled = false;
-AsyncWebServer webServer(80);
 /**
  * Speed and Cadence sensor pins
  */
@@ -50,6 +31,7 @@ AsyncWebServer webServer(80);
 #define GREEN             33
 #define EEPROM_SIZE        4
 #define EEPROM_ADDR_SPIN   0
+#define SPINDOWNDEFAULT 17000  // Default Spindown milliseconds
 
 /**
  * constants for the calculation of the power output
@@ -60,7 +42,6 @@ const float  WARMUP_FACTOR = 0.10;         // factor to increase initial power o
 const double BRAKE_SIZE = 23.35;           // Distance between two brake speed pulses in mm.
 const double WHEEL_SIZE = 2100;            // Circumference of the wheel, to be defined by the rider, in mm.
 const float  TARGETSHIFT_FACTOR = 0.08;    // Shift when x seconds average power deviates from target power by this factor
-const long   SPINDOWNDEFAULT = 13500;     // Default Spindown factor
 
 /**
  * variables for the resistance calculation of the trainer
@@ -102,10 +83,28 @@ unsigned int int_current_power = 0;       // Global variable to hold the calcula
 int int_buttonVal = 0;
 volatile long lg_buttonStartMillis;
 volatile long lg_spindownStartMillis;
-volatile long lg_spindownMillis = 13500; // default spindown  13 seconds, tyre relatively loose - measurements were done with 9 seconds from 50 to 0
+volatile long lg_spindownMillis = SPINDOWNDEFAULT; // default spindown  17000 seconds, tyre relatively loose - measurements were done with 9 seconds from 50 to 0
 int int_spindownPhase = 0; 
 
+// web server variables
+AsyncWebServer webServer(80);
+const char* SSID = "[YOUR WLAN]";                   // <-- Change this
+const char* PASSWORD = "[YOUR WLAN PASSWORD]";      // <-- Change this
+const char* PWM_INPUT = "pwm_input";
+const char* TARGET_INPUT = "target_input";
+const char* SPEED_INPUT = "speed_input";
+const char* SPINDOWN_START = "spindown_start";
+const char* SPINDOWN_SAVE = "spindown_save";
+const char* SPINDOWN_RESET = "spindown_reset";
+const char* PWM_PLUS1 = "pwm_plus1";
+const char* PWM_MINUS1 = "pwm_minus1";
+const char* RESET = "reset";
+const char* ADJUSTMENT_INPUT = "adjustment_input";
+const char* WARMUPMIN_INPUT  = "warmupmin_input";
+const char* WARMUPERC_INPUT  = "warmupperc_input";
 
+boolean bln_appControlled = false;
+boolean bln_speedControlled = false;
 
 
 /** 
@@ -187,7 +186,7 @@ float arr_PowerCurve[14][11] =  {{18.00, 36.00,  63.00,  92.78, 124.23, 158.27, 
                                  {47.77, 81.76, 157.06, 226.44, 299.86, 373.27, 445.00, 485.00, 525.00, 565.00, 605.00},  // 12
                                  {54.62, 85.76, 168.27, 246.64, 327.58, 405.75, 475.00, 515.00, 555.00, 595.00, 635.00}}; // 13  
 
-// actual speed while measiuring   15     20     25     30     35     40     45     50      55    60      65     // resistance level
+// actual speed at target         15     20     25     30     35     40     45     50      55    60      65     // resistance level
 float arr_SpeedCurve[14][11] = {{15.00, 20.00, 25.00, 29.74, 35.84, 40.16, 44.70, 49.38, 54.98, 59.10, 65.00},  // 0
                                 {15.50, 20.08, 24.86, 30.83, 35.97, 40.48, 46.52, 51.26, 56.57, 61.62, 63.29},  // 1
                                 {15.80, 19.99, 25.02, 30.67, 34.94, 40.77, 46.30, 51.88, 56.55, 60.00, 64.50},  // 2
@@ -231,7 +230,7 @@ const char index_html[] PROGMEM = R"rawliteral(
   <div class="container">
   <br>
   <main class="main">
-  <iframe src="/status" title="Current Status" id="status" frameborder="0" height="200">
+  <iframe src="/status" title="Current Status" id="status" frameborder="0" height="250">
   </iframe>
   </main>
   </div>
@@ -328,7 +327,7 @@ const char set_html[] PROGMEM = R"rawliteral(
   </div>
   </form>
   <p>
-  <iframe src="/status" title="Current Status" id="status" frameborder="0" height="200>
+  <iframe src="/status" title="Current Status" id="status" frameborder="0" height="250>
   </iframe>
   </main>
   </div>
@@ -378,7 +377,7 @@ const char spindown_html[] PROGMEM = R"rawliteral(
   <form action="/spindown_html">
   <div class="form-group">
     <input type="hidden" name="spindown_reset" value="spindown_reset">
-    <button type="submit" class="btn btn-outline-primary">Reset Spindown to 13500 ms</button>
+    <button type="submit" class="btn btn-outline-primary">Reset Spindown</button>
   </div>
   </form>
   <form action="/spindown_html">
@@ -388,7 +387,7 @@ const char spindown_html[] PROGMEM = R"rawliteral(
   </div>
   </form>
   <p>
-  <iframe src="/status" title="Current Status" id="status" frameborder="0" height="200>
+  <iframe src="/status" title="Current Status" id="status" frameborder="0" height="250>
   </iframe>
   </main>
   </div>
@@ -519,7 +518,7 @@ class ControlPointCallback: public BLECharacteristicCallbacks {
       //downhill
       if (!bln_appControlled){ // set values unless trainer controlled by App, e.g. spindown
         if (data[4]>200){
-          fl_grade = (data[3]-256 - (255-data[4])*256) * 0.02; // need to double the fl_grade in downhill - tested in Zwift
+          fl_grade = (data[3]-256 - (255-data[4])*256) * 0.01; // need to double the fl_grade in downhill - tested in Zwift
         }
         //uphill
         else{
@@ -988,7 +987,6 @@ void setup() {
           fl_current_speed = inputMessage.toInt();
           bln_appControlled = true;
           bln_speedControlled = true;
-          Serial.println(fl_current_speed);
         }
         else if(inputMessage.toInt()==0){
           bln_speedControlled = false;
@@ -1025,7 +1023,7 @@ void setup() {
       bln_appControlled = true;
     }
     else if (request->hasParam(SPINDOWN_SAVE)) {
-      //int spindownSave = lg_spindownMillis/100; // divide by 100 as max. value in EEPROM is 255
+      int_spindownPhase = 0; // Spindown saved - hide the save button
       EEPROM.put(EEPROM_ADDR_SPIN, lg_spindownMillis); 
       if (EEPROM.commit()) {
         Serial.println("EEPROM successfully committed!");
@@ -1080,7 +1078,7 @@ void setup() {
     else{
       status_html += "<tr><td><b>NOT <small>controlled</small></b></td><td>&nbsp;</td></tr>";
     }
-    status_html += "<tr><td><b>" + String(int_watts_acc) + "</b> <small>int_watts</small></td><td><b>" + String(int_watts) + "</b> <small>int_watts speed</small></td></tr>";
+    status_html += "<tr><td><b>" + String(int_watts_acc) + "</b> <small>Watts</small></td><td><b>" + String(int_watts) + "</b> <small>Watts speed</small></td></tr>";
     status_html += "<tr><td><b>" + String(fl_current_speed) + "</b> <small>km/h</small></td><td><b>" + String(int_currentPwm) + "</b> <small>Resistance</small></td></tr>";
     status_html += "</table></body></html>";
     status_html += "<script language=\"JavaScript\">setTimeout(function(){";
@@ -1133,6 +1131,8 @@ void loop() {
 
       calculate_power();
 
+      // decomment to monitor the current data
+/*    
       Serial.print(lg_current_millis); Serial.print(";");
       Serial.print(fl_current_speed); Serial.print(";");
       Serial.print(int_watts_acc); Serial.print(";");
@@ -1145,7 +1145,7 @@ void loop() {
       Serial.print(bln_ZwiftControlled); Serial.print(";");
       Serial.print(bln_appControlled); Serial.print(";");
       Serial.println(lg_spindownMillis);
-
+*/
       fl_previous_speed = fl_current_speed;    
 
       writeIndoorBikeDataCharacteristic();
