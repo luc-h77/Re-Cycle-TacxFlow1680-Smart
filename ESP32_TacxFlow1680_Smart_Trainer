@@ -1,6 +1,6 @@
 /*
     Re-Cycle Smart Tacx FLow 1680
-    Lukas Hoffmann, 2021
+    Lukas Hoffmann, 2022
 */
 
 //bluetooth
@@ -13,12 +13,14 @@
 #include <WiFi.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
+#include <AsyncElegantOTA.h>
 
 //JSON
 #include <ArduinoJson.h>
 
 //EEPROM - save into ESP32 memory
 #include <Preferences.h>
+
 
 /**
    Speed and Cadence sensor pins
@@ -29,6 +31,13 @@
 #define BUTTON            13
 #define RED               32
 #define GREEN             33
+
+
+/**
+   Program version
+*/
+#define FIRMWARE_VERSION  1.0
+
 
 /**
    constants for the calculation of the power output
@@ -104,6 +113,7 @@ Preferences preferences;
   const char* ADJUSTMENT_INPUT = "adjustment_input";
   const char* WARMUPMIN_INPUT  = "warmupmin_input";
   const char* WARMUPERC_INPUT  = "warmupperc_input";
+  const char* UPDATE = "update";
 
   boolean bln_appControlled = false;
   boolean bln_speedControlled = false;
@@ -205,36 +215,36 @@ volatile boolean bln_doWait = true;
 
 // int_watts measured at speeds  15       20      25       30     35      40      45      50      55      // resistance level
 float arrMeasure[14][9] =  {{35.70, 49.55, 78.10,  107.55, 139.54, 172.76, 196.19, 222.47, 265.11},  // 0
-  {37.30, 55.60, 80.83,  114.75, 151.90, 191.73, 202.44, 254.18, 277.56},  // 1
-  {40.25, 62.67, 92.09,  126.00, 168.29, 195.88, 219.90, 255.00, 299.22},  // 2
-  {41.62, 63.00, 100.80, 137.56, 175.29, 211.00, 249.91, 275.47, 303.28},  // 3
-  {43.00, 68.00, 105.83, 146.20, 196.71, 236.25, 267.80, 298.43, 332.00},  // 4
-  {46.86, 72.67, 114.71, 162.18, 219.57, 260.17, 298.09, 338.56, 365.20},  // 5
-  {47.71,  86.4, 127.00, 174.17, 233.17, 295.40, 325.33, 355.50, 368.22},  // 6
-  {53.3,   92.4, 129.0,  191.0,  244.3,  312.0,  334.2,  363.0,  383.0},   // 7
-  {56.71, 95.17, 140.00, 191.75, 263.86, 329.33, 337.00, 365.77, 385.77},  // 8
-  {59.2,  106.9, 155.8,  220.1,  283.5,  353.8,  361.4,  390.2,  410.2},   // 9
-  {65.2,  109.4, 168.0,  243.1,  305.7,  390.2,  397.9,  426.6,  446.6},   // 10
-  {70.0,  118.4, 180.4,  259.6,  321.6,  413.6,  421.3,  450.0,  470.0},   // 11
-  {70.2,  128.8, 194.8,  270.4,  369.8,  443.4,  451.1,  479.8,  499.8},   // 12
-  {76.3,  135.2, 212.0,  293.5,  378.2,  454.8,  462.5,  491.2,  511.2}
+                            {37.30, 55.60, 80.83,  114.75, 151.90, 191.73, 202.44, 254.18, 277.56},  // 1
+                            {40.25, 62.67, 92.09,  126.00, 168.29, 195.88, 219.90, 255.00, 299.22},  // 2
+                            {41.62, 63.00, 100.80, 137.56, 175.29, 211.00, 249.91, 275.47, 303.28},  // 3
+                            {43.00, 68.00, 105.83, 146.20, 196.71, 236.25, 267.80, 298.43, 332.00},  // 4
+                            {46.86, 72.67, 114.71, 162.18, 219.57, 260.17, 298.09, 338.56, 365.20},  // 5
+                            {47.71,  86.4, 127.00, 174.17, 233.17, 295.40, 325.33, 355.50, 368.22},  // 6
+                            {53.3,   92.4, 129.0,  191.0,  244.3,  312.0,  334.2,  363.0,  383.0},   // 7
+                            {56.71, 95.17, 140.00, 191.75, 263.86, 329.33, 337.00, 365.77, 385.77},  // 8
+                            {59.2,  106.9, 155.8,  220.1,  283.5,  353.8,  361.4,  390.2,  410.2},   // 9
+                            {65.2,  109.4, 168.0,  243.1,  305.7,  390.2,  397.9,  426.6,  446.6},   // 10
+                            {70.0,  118.4, 180.4,  259.6,  321.6,  413.6,  421.3,  450.0,  470.0},   // 11
+                            {70.2,  128.8, 194.8,  270.4,  369.8,  443.4,  451.1,  479.8,  499.8},   // 12
+                            {76.3,  135.2, 212.0,  293.5,  378.2,  454.8,  462.5,  491.2,  511.2}
 };  // 13
 
 // actual speed at target    15     20     25     30     35     40     45     50      55     // resistance level
 float arrSpeeds[14][9] = {{16.73, 19.43, 24.48, 30.13, 35.08, 39.94, 44.86, 49.64, 55.79},  // 0
-  {16.57, 19.68, 24.45, 30.19, 35.49, 41.39, 44.87, 50.75, 55.85},  // 1
-  {16.78, 20.15, 24.84, 30.30, 36.31, 41.01, 45.22, 50.88, 56.17},  // 2
-  {16.61, 19.92, 25.05, 30.01, 36.15, 41.15, 45.64, 50.05, 54.40},  // 3
-  {16.15, 19.95, 24.86, 29.94, 35.40, 41.04, 45.04, 49.38, 54.41},  // 4
-  {16.08, 19.44, 24.29, 29.93, 35.86, 41.06, 45.68, 49.84, 54.23},  // 5
-  {15.69, 19.81, 24.41, 29.23, 35.45, 40.80, 44.92, 48.62, 53.62},  // 6
-  {16.15, 20.32, 24.24, 29.51, 34.98, 41.14, 44.55, 48.97, 55.00},  // 7
-  {16.12, 20.09, 24.57, 29.39, 35.43, 41.45, 44.11, 50.00, 55.00},  // 8
-  {16.08, 20.13, 24.55, 29.45, 35.23, 41.30, 45.00, 50.00, 55.00},  // 9
-  {16.06, 19.91, 24.45, 29.81, 34.90, 40.90, 45.00, 50.00, 55.00},  // 10
-  {16.28, 19.91, 24.65, 29.67, 34.58, 40.08, 45.00, 50.00, 55.00},  // 11
-  {15.77, 20.22, 24.76, 29.60, 35.11, 40.33, 45.00, 50.00, 55.00},  // 12
-  {15.80, 19.99, 24.66, 29.53, 35.08, 39.13, 45.00, 50.00, 55.00}
+                          {16.57, 19.68, 24.45, 30.19, 35.49, 41.39, 44.87, 50.75, 55.85},  // 1
+                          {16.78, 20.15, 24.84, 30.30, 36.31, 41.01, 45.22, 50.88, 56.17},  // 2
+                          {16.61, 19.92, 25.05, 30.01, 36.15, 41.15, 45.64, 50.05, 54.40},  // 3
+                          {16.15, 19.95, 24.86, 29.94, 35.40, 41.04, 45.04, 49.38, 54.41},  // 4
+                          {16.08, 19.44, 24.29, 29.93, 35.86, 41.06, 45.68, 49.84, 54.23},  // 5
+                          {15.69, 19.81, 24.41, 29.23, 35.45, 40.80, 44.92, 48.62, 53.62},  // 6
+                          {16.15, 20.32, 24.24, 29.51, 34.98, 41.14, 44.55, 48.97, 55.00},  // 7
+                          {16.12, 20.09, 24.57, 29.39, 35.43, 41.45, 44.11, 50.00, 55.00},  // 8
+                          {16.08, 20.13, 24.55, 29.45, 35.23, 41.30, 45.00, 50.00, 55.00},  // 9
+                          {16.06, 19.91, 24.45, 29.81, 34.90, 40.90, 45.00, 50.00, 55.00},  // 10
+                          {16.28, 19.91, 24.65, 29.67, 34.58, 40.08, 45.00, 50.00, 55.00},  // 11
+                          {15.77, 20.22, 24.76, 29.60, 35.11, 40.33, 45.00, 50.00, 55.00},  // 12
+                          {15.80, 19.99, 24.66, 29.53, 35.08, 39.13, 45.00, 50.00, 55.00}
 }; // 13
 
 // General variables
@@ -264,13 +274,13 @@ bool bln_wasZwiftControlled = false;
   <div class="container">
   <br>
   <main class="main">
-  <iframe src="/status" title="Current Status" id="status" frameborder="0" height="200">
+  <iframe src="/status" title="Current Status" id="status" frameborder="0" height="300">
   </iframe>
   </main>
   </div>
   </div>
   <div class="footer text-center mt-3">
-    Powered by SmartReCycle Tacx1680
+    <a href = "https://github.com/luc-h77/Re-Cycle-TacxFlow1680-Smart" target = "_blank">SmartReCycle Tacx1680<a> &nbsp; [<a href="update">Update Firmware</a>] 
   </div>    <!-- end container -->
   <!-- JS, Popper.js, and jQuery -->
   <script
@@ -361,7 +371,7 @@ bool bln_wasZwiftControlled = false;
   </div>
   </form>
   <p>
-  <iframe src="/status" title="Current Status" id="status" frameborder="0" height="200>
+  <iframe src="/status" title="Current Status" id="status" frameborder="0" height="300>
   </iframe>
   </main>
   </div>
@@ -421,7 +431,7 @@ bool bln_wasZwiftControlled = false;
   </div>
   </form>
   <p>
-  <iframe src="/status" title="Current Status" id="status" frameborder="0" height="200>
+  <iframe src="/status" title="Current Status" id="status" frameborder="0" height="300>
   </iframe>
   </main>
   </div>
@@ -600,24 +610,6 @@ class MyServerCallbacks: public BLEServerCallbacks {
     }
 };
 
-/*
-class BLEDescriptorMapExt: public BLEDescriptorMap {
-  void handleGATTServerEvent(
-    esp_gatts_cb_event_t      event,
-    esp_gatt_if_t             gatts_if,
-    esp_ble_gatts_cb_param_t* param) override ;
-};
-
-  void BLEDescriptorMapExt::handleGATTServerEvent(
-    esp_gatts_cb_event_t      event,
-    esp_gatt_if_t             gatts_if,
-    esp_ble_gatts_cb_param_t* param) {
-
-
-    }
-/*
-
-
 /**
    Resets the device, called in case of sync error
 
@@ -791,6 +783,8 @@ void calculate_power() {
    Phsae 5: Spindown started, accelerating to reach 53 km/h
    Phase 4: 50km/h reached, spinning down
    Phase 3: Waiting for speed to drop under 10 km/h
+   Phase 1: Spindown is completed - but not saved
+   Phase 0: Spindown is saved to SPIFF - and starting position
    max spindown duration: 50 seconds
 */
 void spinDown() {
@@ -924,10 +918,9 @@ void serialEvent() {
   void notFound
   Web Server error page
 */
-  void notFound(AsyncWebServerRequest *request) {
-  request->send(404, "text/plain", "Not found");
-  }
-
+void notFound(AsyncWebServerRequest *request) {
+request->send(404, "text/plain", "Not found");
+}
 
 /**
    Setup Method
@@ -937,6 +930,8 @@ void setup() {
 
   Serial.begin(115200);
   Serial.println("setup()");
+  Serial.print("FIRMWARE_VERSION: ");
+  Serial.println(FIRMWARE_VERSION);
 
   led_red.set_mode(0);
   led_green.set_mode(0);
@@ -1031,8 +1026,6 @@ void setup() {
     int_str_len = str_wifi_pw.length();
     char chr_wifi_pw[int_str_len]; //= str_wifi_pw;
     str_wifi_pw.toCharArray(chr_wifi_pw, int_str_len);
-    Serial.println(chr_wifi_ssid);
-    Serial.println(chr_wifi_pw);
     WiFi.begin(chr_wifi_ssid, chr_wifi_pw);
     if (WiFi.waitForConnectResult() != WL_CONNECTED) {
       Serial.println("WiFi Connection failed - continue without Wifi");
@@ -1146,7 +1139,7 @@ void setup() {
         preferences.begin("Tacx1680", false);
         preferences.putLong("spindown", lg_spindownMillis);
         preferences.end();
-
+        int_spindownPhase = 0;    // hide the spindown save button
         Serial.print("Spindown saved: ");
         Serial.println(lg_spindownMillis);
       }
@@ -1192,8 +1185,8 @@ void setup() {
       else{
         status_html += "<tr><td><b>NOT <small>controlled</small></b></td><td>&nbsp;</td></tr>";
       }
-      status_html += "<tr><td><b>" + String(int_watts_acc) + "</b> <small>int_watts</small></td><td><b>" + String(int_watts) + "</b> <small>int_watts speed</small></td></tr>";
-      status_html += "<tr><td><b>" + String(fl_current_speed) + "</b> <small>km/h</small></td><td><b>" + String(int_currentPwm) + "</b> <small>Resistance</small></td></tr>";
+      status_html += "<tr><td><b>" + String(int_watts_acc) + "</b> <small>Watts</small></td><td><b>" + String(int_watts) + "</b> <small>Speed Watts</small></td></tr>";
+      status_html += "<tr><td><b>" + String(fl_current_speed) + "</b> <small>km/h</small></td><td><b>" + String(int_currentPwm) + "</b> <small>Resistance (0-13)</small></td></tr>";
       status_html += "</table></body></html>";
       status_html += "<script language=\"JavaScript\">setTimeout(function(){";
       status_html += "window.location.reload();";
@@ -1202,6 +1195,7 @@ void setup() {
       request->send(200, "text/html", status_html);
     });
     webServer.onNotFound(notFound);
+    AsyncElegantOTA.begin(&webServer);
     webServer.begin();
 }
 
