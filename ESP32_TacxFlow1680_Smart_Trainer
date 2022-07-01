@@ -34,21 +34,22 @@
 
 
 /**
-   Program version
+   Program version 1.01
+   Supporting the Access Point Mode
 */
-#define FIRMWARE_VERSION  1.0
+#define FIRMWARE_VERSION  1.01
 
 
 /**
    constants for the calculation of the power output
 */
-const float  ADJ_FACTOR = 1.05;            // Kickr reports 5% more than Power2Max crank used for testing. Align Trainer with Kickr
+const float  ADJ_FACTOR = 1.50;            // Kickr reports 5% more than Power2Max crank used for testing. Align Trainer with Kickr
 const int    WEIGHT_ACC  = 90;             // Weight rider + bike. Don't change this, required for the power calculation with acceleration
-const float  WARMUP_FACTOR = 0.10;         // factor to increase initial power output as trainer reports less during warm-up period
+const float  WARMUP_FACTOR = 0.20;         // factor to increase initial power output as trainer reports less during warm-up period
 const double BRAKE_SIZE = 23.35;           // Distance between two brake speed pulses in mm.
 const double WHEEL_SIZE = 2100;            // Circumference of the wheel, to be defined by the rider, in mm.
 const float  TARGETSHIFT_FACTOR = 0.08;    // Shift when x seconds average power deviates from target power by this factor
-const long   SPINDOWNDEFAULT = 13500;     // Default Spindown factor
+const long   SPINDOWNDEFAULT = 17000;     // Default Spindown factor used with ESP32 WROOM test
 
 /**
    variables for the resistance calculation of the trainer
@@ -101,6 +102,7 @@ Preferences preferences;
   AsyncWebServer webServer(80);
   String str_wifi_ssid;
   String str_wifi_pw;
+  String str_wifi_ip;
   const char* PWM_INPUT = "pwm_input";
   const char* TARGET_INPUT = "target_input";
   const char* SPEED_INPUT = "speed_input";
@@ -118,12 +120,17 @@ Preferences preferences;
   boolean bln_appControlled = false;
   boolean bln_speedControlled = false;
 
+
 //serial communication data types
 int number;
 String inputString = "";         // a String to hold incoming data
 bool stringComplete = false;  // whether the string is complete
 char inputType;
 int inputValue = 0;
+bool bln_speed = false;
+bool bln_sync = false;
+bool bln_trace = false;
+
 
 /**
    The Fitness Machine Control Point data type structure
@@ -213,39 +220,39 @@ boolean bln_pwmSignalStarted = false;                                           
 volatile unsigned long lg_syncTime = 4294967295;                                                    // Initialised to max long
 volatile boolean bln_doWait = true;
 
-// int_watts measured at speeds  15       20      25       30     35      40      45      50      55      // resistance level
-float arrMeasure[14][9] =  {{35.70, 49.55, 78.10,  107.55, 139.54, 172.76, 196.19, 222.47, 265.11},  // 0
-                            {37.30, 55.60, 80.83,  114.75, 151.90, 191.73, 202.44, 254.18, 277.56},  // 1
-                            {40.25, 62.67, 92.09,  126.00, 168.29, 195.88, 219.90, 255.00, 299.22},  // 2
-                            {41.62, 63.00, 100.80, 137.56, 175.29, 211.00, 249.91, 275.47, 303.28},  // 3
-                            {43.00, 68.00, 105.83, 146.20, 196.71, 236.25, 267.80, 298.43, 332.00},  // 4
-                            {46.86, 72.67, 114.71, 162.18, 219.57, 260.17, 298.09, 338.56, 365.20},  // 5
-                            {47.71,  86.4, 127.00, 174.17, 233.17, 295.40, 325.33, 355.50, 368.22},  // 6
-                            {53.3,   92.4, 129.0,  191.0,  244.3,  312.0,  334.2,  363.0,  383.0},   // 7
-                            {56.71, 95.17, 140.00, 191.75, 263.86, 329.33, 337.00, 365.77, 385.77},  // 8
-                            {59.2,  106.9, 155.8,  220.1,  283.5,  353.8,  361.4,  390.2,  410.2},   // 9
-                            {65.2,  109.4, 168.0,  243.1,  305.7,  390.2,  397.9,  426.6,  446.6},   // 10
-                            {70.0,  118.4, 180.4,  259.6,  321.6,  413.6,  421.3,  450.0,  470.0},   // 11
-                            {70.2,  128.8, 194.8,  270.4,  369.8,  443.4,  451.1,  479.8,  499.8},   // 12
-                            {76.3,  135.2, 212.0,  293.5,  378.2,  454.8,  462.5,  491.2,  511.2}
-};  // 13
+// watts measured at speeds  15       20      25       30     35      40      45      50      55      60      65      // resistance level
+float arrMeasure[14][11] =  {{18.00, 36.00,  63.00,  92.78, 124.23, 158.27, 170.90, 194.42, 245.43, 276.25, 292.00},  // 0
+                             {19.86, 39.56,  66.10,  96.92, 124.83, 151.50, 186.39, 214.33, 249.50, 290.00, 308.67},  // 1
+                             {22.50, 44.47,  72.07, 105.14, 127.92, 165.45, 197.67, 234.31, 258.44, 295.00, 311.25},  // 2
+                             {24.90, 45.71,  77.71, 111.56, 141.41, 164.00, 212.57, 261.57, 287.00, 322.00, 339.56},  // 3
+                             {25.93, 52.00,  83.33, 124.85, 160.30, 189.50, 229.77, 268.38, 319.50, 317.00, 371.33},  // 4
+                             {30.35, 55.46,  93.41, 137.93, 174.71, 214.35, 256.60, 306.00, 341.30, 365.00, 393.00},  // 5
+                             {33.00, 60.91, 100.86, 144.86, 190.44, 226.00, 280.79, 332.60, 362.60, 392.60, 422.60},  // 6
+                             {36.23, 64.73, 106.57, 157.61, 203.40, 248.58, 307.23, 352.44, 382.44, 412.44, 442.44},  // 7
+                             {36.20, 66.31, 110.00, 166.07, 215.92, 266.50, 320.13, 360.13, 400.13, 440.13, 480.13},  // 8
+                             {38.32, 74.64, 115.07, 179.72, 236.64, 268.80, 348.56, 388.56, 428.56, 468.56, 508.56},  // 9
+                             {46.20, 67.38, 128.06, 193.33, 253.29, 318.62, 399.60, 439.60, 479.60, 519.60, 559.60},  // 10
+                             {48.40, 70.90, 140.36, 211.79, 278.92, 358.82, 430.00, 470.00, 510.00, 550.00, 590.00},  // 11
+                             {47.77, 81.76, 157.06, 226.44, 299.86, 373.27, 445.00, 485.00, 525.00, 565.00, 605.00},  // 12
+                             {54.62, 85.76, 168.27, 246.64, 327.58, 405.75, 475.00, 515.00, 555.00, 595.00, 635.00}}; // 13  
 
-// actual speed at target    15     20     25     30     35     40     45     50      55     // resistance level
-float arrSpeeds[14][9] = {{16.73, 19.43, 24.48, 30.13, 35.08, 39.94, 44.86, 49.64, 55.79},  // 0
-                          {16.57, 19.68, 24.45, 30.19, 35.49, 41.39, 44.87, 50.75, 55.85},  // 1
-                          {16.78, 20.15, 24.84, 30.30, 36.31, 41.01, 45.22, 50.88, 56.17},  // 2
-                          {16.61, 19.92, 25.05, 30.01, 36.15, 41.15, 45.64, 50.05, 54.40},  // 3
-                          {16.15, 19.95, 24.86, 29.94, 35.40, 41.04, 45.04, 49.38, 54.41},  // 4
-                          {16.08, 19.44, 24.29, 29.93, 35.86, 41.06, 45.68, 49.84, 54.23},  // 5
-                          {15.69, 19.81, 24.41, 29.23, 35.45, 40.80, 44.92, 48.62, 53.62},  // 6
-                          {16.15, 20.32, 24.24, 29.51, 34.98, 41.14, 44.55, 48.97, 55.00},  // 7
-                          {16.12, 20.09, 24.57, 29.39, 35.43, 41.45, 44.11, 50.00, 55.00},  // 8
-                          {16.08, 20.13, 24.55, 29.45, 35.23, 41.30, 45.00, 50.00, 55.00},  // 9
-                          {16.06, 19.91, 24.45, 29.81, 34.90, 40.90, 45.00, 50.00, 55.00},  // 10
-                          {16.28, 19.91, 24.65, 29.67, 34.58, 40.08, 45.00, 50.00, 55.00},  // 11
-                          {15.77, 20.22, 24.76, 29.60, 35.11, 40.33, 45.00, 50.00, 55.00},  // 12
-                          {15.80, 19.99, 24.66, 29.53, 35.08, 39.13, 45.00, 50.00, 55.00}
-}; // 13
+// actual speed at target    15     20     25     30     35     40     45     50      55    60      65     // resistance level
+float arrSpeeds[14][11] = {{15.00, 20.00, 25.00, 29.74, 35.84, 40.16, 44.70, 49.38, 54.98, 59.10, 65.00},  // 0
+                           {15.50, 20.08, 24.86, 30.83, 35.97, 40.48, 46.52, 51.26, 56.57, 61.62, 63.29},  // 1
+                           {15.80, 19.99, 25.02, 30.67, 34.94, 40.77, 46.30, 51.88, 56.55, 60.00, 64.50},  // 2
+                           {16.00, 19.92, 24.87, 30.41, 34.93, 40.23, 45.43, 50.79, 56.25, 60.00, 64.20},  // 3
+                           {15.79, 19.98, 24.72, 30.44, 34.96, 39.42, 44.86, 50.44, 57.00, 57.61, 64.86},  // 4
+                           {16.09, 19.96, 24.64, 30.39, 35.71, 39.91, 44.54, 50.70, 56.18, 60.00, 64.26},  // 5
+                           {16.09, 19.97, 24.61, 30.00, 34.51, 38.54, 44.78, 50.79, 55.00, 60.00, 65.00},  // 6
+                           {16.62, 19.91, 24.52, 29.82, 34.36, 39.20, 44.93, 50.74, 55.00, 60.00, 65.00},  // 7
+                           {16.77, 19.69, 24.54, 30.22, 34.97, 39.79, 45.35, 50.00, 55.00, 60.00, 65.00},  // 8
+                           {16.82, 20.15, 24.13, 30.15, 35.06, 38.75, 44.55, 50.00, 55.00, 60.00, 65.00},  // 9
+                           {16.94, 19.37, 24.43, 30.06, 34.66, 38.72, 44.85, 50.00, 55.00, 60.00, 65.00},  // 10
+                           {17.03, 19.20, 24.52, 29.70, 34.36, 39.57, 45.00, 50.00, 55.00, 60.00, 65.00},  // 11
+                           {16.98, 19.59, 24.88, 29.83, 34.64, 39.14, 45.00, 50.00, 55.00, 60.00, 65.00},  // 12
+                           {16.99, 19.46, 24.67, 29.71, 34.32, 38.86, 45.00, 50.00, 55.00, 60.00, 65.00}}; // 13   
+
+
 
 // General variables
 long lg_current_millis;
@@ -268,6 +275,7 @@ bool bln_wasZwiftControlled = false;
     <a href="/" class="btn btn-primary active">Status</a>
     <a href="set_html" class="btn btn-primary">Set</a>
     <a href="spindown_html" class="btn btn-primary">Spindown</a>
+    <a href="connect_html" class="btn btn-primary">Connect WIFI</a>
   </div>
   <p>&nbsp;
   <div class="codesection">
@@ -314,6 +322,7 @@ bool bln_wasZwiftControlled = false;
     <a href="/" class="btn btn-primary">Status</a>
     <a href="set_html" class="btn btn-primary active">Set</a>
     <a href="spindown_html" class="btn btn-primary">Spindown</a>
+    <a href="connect_html" class="btn btn-primary">Connect WIFI</a>
   </div>
   <br>&nbsp;
   <div class="codesection">
@@ -363,6 +372,12 @@ bool bln_wasZwiftControlled = false;
      <label for="target_input">Fake Speed (0..60)</label>
     <input type="number" min="0" max="60" class="form-control" name="speed_input" id="speed_input" aria-describedby="Pwm" value="%SPEEDPLACEHOLDER%">
   </div>
+  </form>
+  <form action="/set_html">
+  <div class="form-group">
+     <label for="target_input">Power Adjustment Factor (0.50 ... 1.50)</label>
+    <input type="number" step="0.01" min="0.50" max="1.50" class="form-control" name="adjustment_input" id="adj_factor" aria-describedby="Pwm" value="%ADJFACTORPLACEHOLDER%">
+  </div>
   </form><br>
   <form action="/set_html">
   <div class="form-group">
@@ -410,6 +425,7 @@ bool bln_wasZwiftControlled = false;
     <a href="/" class="btn btn-primary">Status</a>
     <a href="set_html" class="btn btn-primary">Set</a>
     <a href="spindown_html" class="btn btn-primary active">Spindown</a>
+    <a href="connect_html" class="btn btn-primary">Connect WIFI</a>
   </div>
   <br>&nbsp;
   <div class="codesection">
@@ -417,7 +433,6 @@ bool bln_wasZwiftControlled = false;
   <main class="main">
   Spindown milliseconds: %SPINDOWNPLACEHOLDER%
   <p>
-  %SPINDOWNSAVEPLACEHOLDER%
   <form action="/spindown_html">
   <div class="form-group">
     <input type="hidden" name="spindown_reset" value="spindown_reset">
@@ -456,7 +471,34 @@ bool bln_wasZwiftControlled = false;
   </script>
   </body></html>)rawliteral";
 
-
+  const char AP_INDEX_HTML[] PROGMEM = R"rawliteral(
+  <!DOCTYPE HTML><html><head>
+  <title>SmartReCycle Tacx1680</title>
+    <link rel="stylesheet"
+      href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css"
+      integrity="sha384-JcKb8q3iqJ61gNV9KGb8thSsNjpSL0n8PARn9HuZOnIxN0hoP+VmmDGMN5t9UJ0Z"
+      crossorigin="anonymous"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1", shrink-to-fit=no">
+  </head>
+  <body>
+  <div class="btn-group">
+    <a href="/" class="btn btn-primary">Status</a>
+    <a href="set_html" class="btn btn-primary">Set</a>
+    <a href="spindown_html" class="btn btn-primary">Spindown</a>
+    <a href="connect_html" class="btn btn-primary active">Connect WIFI</a>
+  </div>
+  <h3>Enter your WiFi credentials</h3>
+  <form action="/connect_html" method="get">
+  <div class="form-group">
+  <label>SSID:&nbsp;</label>
+  <input maxlength="30" name="ssid" class="form-control"><br>
+  <label>Key:&nbsp;&nbsp;&nbsp;&nbsp;</label><input maxlength="30" name="password" class="form-control"><br>
+  <button type="submit" class="btn btn-outline-primary" value="Save">Save Credentials</button>
+  </div>
+  </form>
+  <p>%IPPLACEHOLDER%
+  </body>
+  </html>)rawliteral";
 
   // Replaces placeholder with button section in your web page
   String placeholder = "";
@@ -486,16 +528,23 @@ bool bln_wasZwiftControlled = false;
     String output_text = String(lg_spindownMillis);
     return output_text;
   }
-  else if(var == "SPINDOWNSAVEPLACEHOLDER"){
-    if (int_spindownPhase==1){
-      String output_text = "<form action=\"/spindown_html\">";
-      output_text += "<div class=\"form-group\">";
-      output_text += "<input type=\"hidden\" name=\"spindown_save\" value=\"spindown_save\">";
-      output_text += "<button type=\"submit\" class=\"btn btn-outline-primary\">Save Spindown Result</button>";
-      output_text += "</div></form>";
-      return output_text;
-    }
+  else if(var == "ADJFACTORPLACEHOLDER"){
+    String output_text = String(fl_adj_factor);
+    return output_text;
   }
+  else if(var == "IPPLACEHOLDER"){
+    String output_text ;
+    if (WiFi.waitForConnectResult() == WL_CONNECTED){
+      output_text += "Wifi is connected. To launch control panel:";
+      output_text += "<br> - Connect wifi to internet";
+      output_text += "<br> - go to: <a href=http://""" + WiFi.localIP().toString() + """>" + str_wifi_ip + "</>";
+    }
+    else{
+     output_text += "Wifi is not connected. Enter SSID and password to connect";
+   }
+    return output_text;
+  }
+  
   return String();
   }
 
@@ -705,11 +754,17 @@ int setTrainerResistance(float fl_wind_speed, float fl_grade, float fl_crr, floa
 void syncInterrupt() {
   lg_syncTime = micros();
   bln_doWait = false;
+  if(bln_sync){
+    Serial.println("Sync");
+  }
 }
 
 void speedInterrupt() {
   lg_speed_counter++;
   lg_speed_timer = millis();
+  if(bln_speed){
+    Serial.println("Speed");
+  }
 }
 
 /**
@@ -766,8 +821,8 @@ void calculate_power() {
   // acceleration
   int_watts_acc = int_watts  + (fl_current_speed - fl_previous_speed) / 3.6 * WEIGHT_ACC;
 
-  // sets int_watts to 0 if negative
-  if (int_watts_acc < 0) {
+  // sets int_watts to 0 if <35 - sync messages keep the speed at 8.41 which translates mostly to 22-24 watts
+  if (int_watts_acc < 35) {
     int_watts_acc = 0;
   }
 
@@ -826,8 +881,12 @@ void spinDown() {
         if (fl_time_factor > 1.05) { // still in first half of warmup, add a second
           lg_spindownMillis = lg_spindownMillis + 1000;
         }
+        //Save the Spindown Millis
+        preferences.begin("Tacx1680", false);
+        preferences.putLong("spindown", lg_spindownMillis);
+        preferences.end();
         lg_buttonStartMillis = 0;
-        int_spindownPhase = 1; //int_spindownPhase = 1: Successful spindown completed
+        int_spindownPhase = 0; //1: Successful spindown completed, 0: Completed and saved
         if (bln_ZwiftControlled) {
           led_green.set_mode(1); // show green LED, continue Zwifting
         }
@@ -908,6 +967,36 @@ void serialEvent() {
         resetFunc();
       }
     }
+    else if (str_input_ID == "<SYNC>"){
+      if(bln_sync==true){
+        bln_sync = false;
+        Serial.println("Sync trace off");
+      }
+      else{
+        bln_sync = true;
+        Serial.println("Sync trace on");
+      }
+    }
+    else if (str_input_ID == "<SPED>"){
+      if(bln_speed==true){
+        bln_speed = false;
+        Serial.println("Speed trace off");
+      }
+      else{
+        bln_speed = true;
+        Serial.println("Speed trace on");
+      }
+    }
+    else if (str_input_ID == "<TRAC>"){
+      if(bln_trace==true){
+        bln_trace = false;
+        Serial.println("Log trace off");
+      }
+      else{
+        bln_trace = true;
+        Serial.println("Log trace on");
+      }
+    }
 
     // clear the string:
     inputString = "";
@@ -920,6 +1009,36 @@ void serialEvent() {
 */
 void notFound(AsyncWebServerRequest *request) {
 request->send(404, "text/plain", "Not found");
+}
+
+void wifiConnect(){
+  int int_str_len = str_wifi_ssid.length() + 1;
+  char chr_wifi_ssid[int_str_len]; //= str_wifi_ssid;
+  str_wifi_ssid.toCharArray(chr_wifi_ssid, int_str_len);
+  int_str_len = str_wifi_pw.length() + 1;
+  char chr_wifi_pw[int_str_len]; //= str_wifi_pw;
+  str_wifi_pw.toCharArray(chr_wifi_pw, int_str_len);
+  Serial.println(chr_wifi_ssid);
+  Serial.println(chr_wifi_pw);
+  delay(500);
+  WiFi.begin(chr_wifi_ssid, chr_wifi_pw);
+  if (WiFi.waitForConnectResult() != WL_CONNECTED) {
+    WiFi.disconnect(true);
+  }
+  if (WiFi.waitForConnectResult() == WL_CONNECTED) {
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+    // update the wifi IP on the device
+    if (str_wifi_ip != WiFi.localIP().toString()){
+      str_wifi_ip = WiFi.localIP().toString();
+      preferences.begin("Tacx1680", false);
+      preferences.putString("wifi_ip", str_wifi_ip);
+      preferences.end();
+    }    
+  }
+  else{
+    Serial.println("WiFi Connection failed - connect to wifi network ESP32 and enter 192.168.4.1 in browser. Wifi Password is pass");
+  }
 }
 
 /**
@@ -946,7 +1065,7 @@ void setup() {
   lg_spindownMillis = SPINDOWNDEFAULT;
 
   // read he spindown from memory
-  preferences.begin("Tacx1680", false);
+  preferences.begin("Tacx1680", true);
   long lg_spindownSaved = preferences.getLong("spindown", 0);
   if (lg_spindownSaved>1000){
     lg_spindownMillis = lg_spindownSaved;
@@ -955,11 +1074,11 @@ void setup() {
     lg_spindownMillis = SPINDOWNDEFAULT;
   }
   str_wifi_ssid = preferences.getString("wifi_ssid", "wifi");
-  str_wifi_pw = preferences.getString("wifi_pw", "PASSWORD");
+  str_wifi_pw   = preferences.getString("wifi_pw", "PASSWORD");
+  str_wifi_ip   = preferences.getString("wifi_ip", "IP");
+  fl_adj_factor = preferences.getFloat("adj_factor", ADJ_FACTOR);
   preferences.end();
 
-  // set the default adjustment factor
-  fl_adj_factor = ADJ_FACTOR; 
 
   // set up the sensors
   bln_pwmSignalStarted = false;
@@ -1019,25 +1138,45 @@ void setup() {
   pAdvertising->start();
 
   // Connect to Wifi
-    WiFi.mode(WIFI_STA);
-    int int_str_len = str_wifi_ssid.length();
-    char chr_wifi_ssid[int_str_len]; //= str_wifi_ssid;
-    str_wifi_ssid.toCharArray(chr_wifi_ssid, int_str_len);
-    int_str_len = str_wifi_pw.length();
-    char chr_wifi_pw[int_str_len]; //= str_wifi_pw;
-    str_wifi_pw.toCharArray(chr_wifi_pw, int_str_len);
-    WiFi.begin(chr_wifi_ssid, chr_wifi_pw);
-    if (WiFi.waitForConnectResult() != WL_CONNECTED) {
-      Serial.println("WiFi Connection failed - continue without Wifi");
-    }
-    else{
-      Serial.print("IP Address: ");
-      Serial.println(WiFi.localIP());
-    }
+    //WiFi.mode(WIFI_STA);
+    WiFi.mode(WIFI_MODE_APSTA);
+    WiFi.softAP("ESP32", "pass");
+
+    wifiConnect();
 
     // Send web page with input fields to client
     webServer.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
-      request->send_P(200, "text/html", index_html, processor);
+      request->send_P(200, "text/html", index_html, processor);        
+    });
+
+    webServer.on("/connect_html", HTTP_GET, [](AsyncWebServerRequest *request){
+      if (ON_AP_FILTER(request)){//access point mode
+        if (request->hasParam("ssid") && request->hasParam("password")) {
+          str_wifi_ssid = request->getParam("ssid")->value();
+          str_wifi_pw = request->getParam("password")->value();
+          preferences.begin("Tacx1680", false);
+          preferences.putString("wifi_ssid", str_wifi_ssid);
+          preferences.putString("wifi_pw", str_wifi_pw);
+          preferences.end();
+          Serial.println("Wifi SSID and Password saved");
+
+          wifiConnect();
+
+          if (WiFi.waitForConnectResult() == WL_CONNECTED) {
+            str_wifi_ip = WiFi.localIP().toString();
+            preferences.begin("Tacx1680", false);
+            preferences.putString("wifi_ip", str_wifi_ip);
+            preferences.end();
+          }
+
+          //Serial.println("Rebooting...........");
+          //resetFunc();
+        }
+        request->send_P(200, "text/html", AP_INDEX_HTML, processor);
+      }
+      else{  //(ON_STA_FILTER(request))
+        request->send_P(200, "text/html", "Connect to WIFI network starting with ESP32... and then navigate to <a href=http://192.168.4.1/connect.html>192.168.4.1/connect.html</a>", processor);        
+      }
     });
 
     webServer.on("/set_html", HTTP_GET, [] (AsyncWebServerRequest *request) {
@@ -1097,7 +1236,6 @@ void setup() {
             fl_current_speed = inputMessage.toInt();
             bln_appControlled = true;
             bln_speedControlled = true;
-            Serial.println(fl_current_speed);
           }
           else if(inputMessage.toInt()==0){
             bln_speedControlled = false;
@@ -1115,6 +1253,19 @@ void setup() {
         bln_appControlled = false;
         bln_speedControlled = false;
       }
+      else if (request->hasParam(ADJUSTMENT_INPUT)) {
+        inputMessage = request->getParam(ADJUSTMENT_INPUT)->value();
+        if (isNumber(inputMessage)){
+          fl_adj_factor = inputMessage.toFloat();
+          if ( fl_adj_factor<= 1.50 && fl_adj_factor >= 0.50){
+            fl_adj_factor = inputMessage.toFloat();
+            preferences.begin("Tacx1680", false);
+            preferences.putFloat("adj_factor", fl_adj_factor);
+            preferences.end();
+          }
+        }
+      }
+      
       else {
         inputMessage = "No message sent";
         inputParam = "none";
@@ -1132,16 +1283,6 @@ void setup() {
         fl_grade = int_currentPwm - 4;
         fl_targetWatts = 0;
         bln_appControlled = true;
-      }
-      else if (request->hasParam(SPINDOWN_SAVE)) {
-        //int spindownSave = lg_spindownMillis/100; // divide by 100 as max. value in EEPROM is 255
-
-        preferences.begin("Tacx1680", false);
-        preferences.putLong("spindown", lg_spindownMillis);
-        preferences.end();
-        int_spindownPhase = 0;    // hide the spindown save button
-        Serial.print("Spindown saved: ");
-        Serial.println(lg_spindownMillis);
       }
       else if (request->hasParam(SPINDOWN_RESET)) {
         int spindownReset = 0;
@@ -1239,18 +1380,20 @@ void loop() {
 
       calculate_power();
 
-      Serial.print(lg_current_millis); Serial.print(";");
-      Serial.print(fl_current_speed); Serial.print(";");
-      Serial.print(int_watts_acc); Serial.print(";");
-      Serial.print(int_watts); Serial.print(";");
-      Serial.print(fl_targetWatts); Serial.print(";");
-      Serial.print(int_currentPwm); Serial.print(";");
-      Serial.print(fl_grade); Serial.print(";");
-      Serial.print(fl_time_factor); Serial.print(";");
-      Serial.print(int_spindownPhase); Serial.print(";");
-      Serial.print(bln_ZwiftControlled); Serial.print(";");
-      Serial.print(bln_appControlled); Serial.print(";");
-      Serial.println(lg_spindownMillis);
+      if (bln_trace){
+        Serial.print(lg_current_millis); Serial.print(";");
+        Serial.print(fl_current_speed); Serial.print(";");
+        Serial.print(int_watts_acc); Serial.print(";");
+        Serial.print(int_watts); Serial.print(";");
+        Serial.print(fl_targetWatts); Serial.print(";");
+        Serial.print(int_currentPwm); Serial.print(";");
+        Serial.print(fl_grade); Serial.print(";");
+        Serial.print(fl_time_factor); Serial.print(";");
+        Serial.print(int_spindownPhase); Serial.print(";");
+        Serial.print(bln_ZwiftControlled); Serial.print(";");
+        Serial.print(bln_appControlled); Serial.print(";");
+        Serial.println(lg_spindownMillis);
+      }
 
       fl_previous_speed = fl_current_speed;
 
