@@ -671,7 +671,7 @@ class MyServerCallbacks: public BLEServerCallbacks {
 */
 void(* resetFunc) (void) = 0;
 
-void  () {
+void writeIndoorBikeDataCharacteristic() {
 
   if (bln_ZwiftControlled) {
     ibdBuffer[0] = 0x00 | flagInstantaneousCadence | flagIntantaneousPower; // More Data = 0 (instantaneous speed present), bit 2: instantaneous cadence present
