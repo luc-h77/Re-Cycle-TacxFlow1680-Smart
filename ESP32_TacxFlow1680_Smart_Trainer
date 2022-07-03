@@ -34,10 +34,10 @@
 
 
 /**
-   Program version 1.01
-   Supporting the Access Point Mode
+   Version 1.02: Fixing the default spindown ms from 13500 to 17000
+   Version 1.01: Supporting the Access Point Mode
 */
-#define FIRMWARE_VERSION  1.01
+#define FIRMWARE_VERSION  1.02
 
 
 /**
@@ -91,7 +91,7 @@ unsigned int int_current_power = 0;       // Global variable to hold the calcula
 int int_buttonVal = 0;
 volatile long lg_buttonStartMillis;
 volatile long lg_spindownStartMillis;
-volatile long lg_spindownMillis = 13500; // default spindown  13 seconds, tyre relatively loose - measurements were done with 9 seconds from 50 to 0
+volatile long lg_spindownMillis = 17000; // default spindown  17 seconds, tyre relatively loose - measurements were done with 9 seconds from 50 to 0
 int int_spindownPhase = 0;
 
 //EEPROM variables
@@ -436,7 +436,7 @@ bool bln_wasZwiftControlled = false;
   <form action="/spindown_html">
   <div class="form-group">
     <input type="hidden" name="spindown_reset" value="spindown_reset">
-    <button type="submit" class="btn btn-outline-primary">Reset Spindown to 13500 ms</button>
+    <button type="submit" class="btn btn-outline-primary">Reset Spindown to 17000 ms</button>
   </div>
   </form>
   <form action="/spindown_html">
@@ -631,6 +631,11 @@ class ControlPointCallback: public BLECharacteristicCallbacks {
           fl_targetWatts = data[1] + (data[2] * 256);
         }
         ftmcpBuffer[0] = fmcpResponseCode;
+
+      }
+      else{ //log all other commands
+        Serial.print("data[0] command: ");
+        Serial.println(data[0]);
       }
 
       ftmcpBuffer[0] = fmcpResponseCode;
@@ -641,6 +646,7 @@ class ControlPointCallback: public BLECharacteristicCallbacks {
 
       lastControlPointEvent = millis();
       pCtrlPointCharacteristic->indicate(); //new
+
     }
 };
 
@@ -665,7 +671,7 @@ class MyServerCallbacks: public BLEServerCallbacks {
 */
 void(* resetFunc) (void) = 0;
 
-void writeIndoorBikeDataCharacteristic() {
+void  () {
 
   if (bln_ZwiftControlled) {
     ibdBuffer[0] = 0x00 | flagInstantaneousCadence | flagIntantaneousPower; // More Data = 0 (instantaneous speed present), bit 2: instantaneous cadence present
