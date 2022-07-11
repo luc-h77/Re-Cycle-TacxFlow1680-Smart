@@ -44,7 +44,7 @@
 /**
    constants for the calculation of the power output
 */
-const float  ADJ_FACTOR = 1.50;            // Kickr reports 5% more than Power2Max crank used for testing. Align Trainer with Kickr
+const float  ADJ_FACTOR = 1.05;            // Kickr reports 5% more than Power2Max crank used for testing. Align Trainer with Kickr
 const int    WEIGHT_ACC  = 90;             // Weight rider + bike. Don't change this, required for the power calculation with acceleration
 const float  WARMUP_FACTOR = 0.20;         // factor to increase initial power output as trainer reports less during warm-up period
 const double BRAKE_SIZE = 23.35;           // Distance between two brake speed pulses in mm.
