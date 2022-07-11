@@ -34,10 +34,11 @@
 
 
 /**
+   Version 1.03: Fixing the bluetooth parameters of the fitness machine settings and the power range - now it is working with rouvy and fulgaz
    Version 1.02: Fixing the default spindown ms from 13500 to 17000
    Version 1.01: Supporting the Access Point Mode
 */
-#define FIRMWARE_VERSION  1.02
+#define FIRMWARE_VERSION  1.03
 
 
 /**
@@ -155,7 +156,7 @@ fmcp_data_ut fmcpData;
 volatile long lastControlPointEvent = 0;
 long previousControlPointEvent = 0;
 
-#define SERVICE_UUID        "00001826-0000-1000-8000-00805f9b34fb"
+#define SERVICE_UUID        "1826" //"00001826-0000-1000-8000-00805f9b34fb"
 #define FEATURE_UUID        BLEUUID((uint16_t)0x2ACC)
 #define INDOORBIKE_UUID     BLEUUID((uint16_t)0x2AD2)
 #define TRAINSTATUS_UUID    BLEUUID((uint16_t)0x2AD3)
@@ -167,9 +168,9 @@ BLECharacteristic *pIndoorBikeCharacteristic = NULL;
 BLECharacteristic *pCtrlPointCharacteristic = NULL;
 BLEServer* pServer = NULL;
 
-unsigned char ftmfBuffer[4] = { 0b10000111, 0b01000000, 0, 0 }; //, 0, 0, 0, 0};                            // Features: 0 (Avg speed), 1 (Cadence), 2 (Total distance), 7 (Resistance level), 10 (Heart rate measurement), 14 (Power measurement)
+unsigned char ftmfBuffer[8] = { 0x02, 0x44, 0x00, 0x00, 0x08, 0x20, 0x00, 0x00 }; // { 0b10000111, 0b01000000, 0, 0 }; //, 0, 0, 0, 0};                            // Features: 0 (Avg speed), 1 (Cadence), 2 (Total distance), 7 (Resistance level), 10 (Heart rate measurement), 14 (Power measurement)
 unsigned char ibdBuffer[8] = { 0, 0, 0, 0, 0, 0, 0, 0} ;
-unsigned char srlrBuffer[4] = { 0, 200, 0, 1};                                                              // Supported Resistance Level Range
+unsigned char srlrBuffer[8] = { 0x32, 0x00, 0x58, 0x02, 0x05, 0x00 }; //{ 0, 200, 0, 1};                                                              // Supported Resistance Level Range
 unsigned char ftmsBuffer[2] = { 0, 0};
 unsigned char tsBuffer[2]   = { 0x0, 0x0};                                                                  // Training status: flags: 0 (no string present); Status: 0x00 = Other
 unsigned char ftmcpBuffer[20];
@@ -1105,7 +1106,7 @@ void setup() {
         FEATURE_UUID,
         BLECharacteristic::PROPERTY_READ
       );
-  pFeatureCharacteristic->setValue(ftmfBuffer, 4);
+  pFeatureCharacteristic->setValue(ftmfBuffer, 8);
   pIndoorBikeCharacteristic = pService->createCharacteristic(
                                 INDOORBIKE_UUID,
                                 BLECharacteristic::PROPERTY_NOTIFY
